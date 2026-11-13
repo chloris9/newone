@@ -36,7 +36,13 @@ local function sheet(part: string): Faces
 	return { Front = part .. "Front", Back = part .. "Back", Left = part .. "Side", Right = part .. "Side" }
 end
 local HEAD_SHEET = { Front = "HeadFront", Back = "HeadBack", Left = "HeadLeft", Right = "HeadRight" }
-local HAIR_SHEET = { Front = "HairFront", Back = "HairBack", Left = "HairLeft", Right = "HairRight" }
+-- Outfield hair: a transparent volume round the top of the head whose decals are cut-out hair renders
+-- (decals still draw on a part with Transparency 1), over a slim opaque cap in kit.hair, which is all
+-- that shows if the images can't load. Sizes and offsets from the head's centre, at scale 1; the
+-- image sizes in tools/assets/build_players.py (FACE) follow HAIR_VOLUME.
+local HAIR_SHEET = { Top = "HairTop", Front = "HairFront", Back = "HairBack", Left = "HairLeft", Right = "HairRight" }
+local HAIR_VOLUME, HAIR_VOLUME_OFFSET = Vector3.new(1.72, 0.92, 1.6), Vector3.new(0, 0.705, 0.06)
+local HAIR_CAP, HAIR_CAP_OFFSET = Vector3.new(1.44, 0.22, 1.34), Vector3.new(0, 0.68, 0)
 
 -- name, size, centre, kit colour, keeper faces, player faces (all at scale 1, feet on y = 0)
 local PARTS: { { any } } = {
@@ -185,17 +191,32 @@ function FigureBuilder.build(name: string, kit: Kit, scale: number, textures: st
 		parts[spec[1]] = part
 	end
 
-	-- Hair: a cap over the top of the head; the face and back textures already show the fringe.
+	-- Hair. The keeper's is a cap over the top of the head; the face and back textures show the fringe.
 	local head = parts.Head
-	local hair = makePart(model, "Hair", Vector3.new(1.5, 0.34, 1.42), head.Position + Vector3.new(0, 0.74, 0.03), kit.hair)
-	local hairFaces: Faces = if keeper then { Front = "Hair", Back = "Hair", Left = "Hair", Right = "Hair" } else HAIR_SHEET
-	for face, image in pairs(hairFaces) do
-		addDecal(hair, face, imageSet .. "/" .. image)
+	local function hairPart(partName: string, size: Vector3, offset: Vector3): Part
+		local part = makePart(model, partName, size, head.Position + offset, kit.hair)
+		local weld = Instance.new("WeldConstraint")
+		weld.Part0 = head
+		weld.Part1 = part
+		weld.Parent = part
+		return part
 	end
-	local hairWeld = Instance.new("WeldConstraint")
-	hairWeld.Part0 = head
-	hairWeld.Part1 = hair
-	hairWeld.Parent = hair
+	if keeper then
+		local hair = hairPart("Hair", Vector3.new(1.5, 0.34, 1.42), Vector3.new(0, 0.74, 0.03))
+		for _, face in { "Front", "Back", "Left", "Right" } do
+			addDecal(hair, face, imageSet .. "/Hair")
+		end
+	else
+		local cap = hairPart("Hair", HAIR_CAP, HAIR_CAP_OFFSET)
+		for _, face in { "Top", "Front", "Back", "Left", "Right" } do
+			addDecal(cap, face, imageSet .. "/HairCap")
+		end
+		local volume = hairPart("HairVolume", HAIR_VOLUME, HAIR_VOLUME_OFFSET)
+		volume.Transparency = 1
+		for face, image in HAIR_SHEET do
+			addDecal(volume, face, imageSet .. "/" .. image)
+		end
+	end
 
 	if kit.number then
 		addPrints(parts, kit)
