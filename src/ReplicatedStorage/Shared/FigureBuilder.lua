@@ -101,12 +101,17 @@ local function addDecal(part: BasePart, face: string, image: string)
 	decal.Parent = part
 end
 
--- Where the painted-out numbers are on the PlayerMain / RivalPlain sheets, as fractions of the face.
+-- Where the number and surname go, as fractions of the face. Footballer style: the number fills the
+-- back, the surname runs across the shoulders above it.
 local PRINTS = {
-	{ part = "UpperTorso", face = Enum.NormalId.Front, name = "ChestNumber", box = { 0.30, 0.42, 0.40, 0.42 } },
-	{ part = "UpperTorso", face = Enum.NormalId.Back, name = "BackNumber", box = { 0.22, 0.32, 0.56, 0.60 } },
-	{ part = "LeftUpperLeg", face = Enum.NormalId.Front, name = "ShortsNumber", box = { 0.38, 0.35, 0.40, 0.40 } },
+	{ part = "UpperTorso", face = Enum.NormalId.Front, name = "ChestNumber", box = { 0.30, 0.36, 0.40, 0.50 } },
+	{ part = "UpperTorso", face = Enum.NormalId.Back, name = "BackNumber", box = { 0.10, 0.27, 0.80, 0.71 } },
+	{ part = "LeftUpperLeg", face = Enum.NormalId.Front, name = "ShortsNumber", box = { 0.38, 0.30, 0.42, 0.45 } },
 }
+local SURNAME_BOX = { 0.04, 0.02, 0.92, 0.26 }
+-- TextScaled never goes above 100 px, so the canvas is sized from the face (PixelsPerStud) to keep
+-- the text within that cap; the default 800x600 canvas left the prints at a sixth of the shirt.
+local PRINT_PIXELS_PER_STUD = 60
 
 local function printLabel(gui: Instance, name: string, box: { number }, text: string, color: Color3): TextLabel
 	local label = Instance.new("TextLabel")
@@ -119,6 +124,8 @@ local function printLabel(gui: Instance, name: string, box: { number }, text: st
 	label.Text = text
 	label.TextScaled = true
 	label.TextColor3 = color
+	label.TextStrokeColor3 = Color3.new(0, 0, 0)
+	label.TextStrokeTransparency = 0.7
 	label.Parent = gui
 	return label
 end
@@ -134,6 +141,8 @@ local function addPrints(parts: { [string]: BasePart }, kit: Kit)
 			gui = Instance.new("SurfaceGui")
 			gui.Name = "Print" .. spec.face.Name
 			gui.Face = spec.face
+			gui.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud
+			gui.PixelsPerStud = PRINT_PIXELS_PER_STUD
 			gui.LightInfluence = 1
 			gui.Parent = parts[spec.part]
 			guis[key] = gui
@@ -141,7 +150,7 @@ local function addPrints(parts: { [string]: BasePart }, kit: Kit)
 		local label = printLabel(gui, spec.name, spec.box, tostring(kit.number or ""), color)
 		label:SetAttribute("KitNumber", true)
 	end
-	local surname = printLabel(guis.UpperTorsoBack, "Surname", { 0.03, 0.01, 0.94, 0.3 }, kit.surname or "", color)
+	local surname = printLabel(guis.UpperTorsoBack, "Surname", SURNAME_BOX, kit.surname or "", color)
 	surname:SetAttribute("KitSurname", true)
 end
 

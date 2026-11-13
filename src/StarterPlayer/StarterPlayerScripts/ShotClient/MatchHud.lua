@@ -1,8 +1,12 @@
--- Match screen. Between your moments the whole screen is the commentator's studio: scoreboard,
--- the commentator's live feed, the match timeline, and your player's card with the stamina bar
--- and the two tactics (effort: 1-3 hearts, focus: attack / defense). The 3D pitch only shows
--- during your moments, with the pressure bar and the high-ball switch on top. Same pixel-kit
--- style and scale as the career menus (UiKit). It never decides anything itself.
+-- Match screens (one ScreenGui, laid out in screen fractions so it fills any landscape screen):
+--   STUDIO, between your moments: broadcast scoreboard, the commentator's feed (bars that fill an
+--     empty board one by one, a new board for each chance), your player card with energy, the
+--     work-rate and focus cards (each opens a chooser), the moments so far, and the big PLAY button
+--     when your moment comes.
+--   PLAY, your moment on the pitch: compact scoreboard, the time left before the tackle, the hint,
+--     the strike screen (stopwatch, how the hit point works, the reticle) and result banners.
+--   The full-time card.
+-- It never decides anything: the entry script feeds it server updates and wires its callbacks.
 
 local SoundService = game:GetService("SoundService")
 local TweenService = game:GetService("TweenService")
@@ -11,359 +15,640 @@ local UiKit = require(script.Parent:WaitForChild("UiKit"))
 local Commentary = require(script.Parent:WaitForChild("Commentary"))
 
 local create, frame, text, corner, stroke, outline = UiKit.create, UiKit.frame, UiKit.text, UiKit.corner, UiKit.stroke, UiKit.outline
-local NAVY, VIOLET, GLOW, LILAC, GOLD, LIME, RED = UiKit.NAVY, UiKit.VIOLET, UiKit.GLOW, UiKit.LILAC, UiKit.GOLD, UiKit.LIME, UiKit.RED
+local rgb = UiKit.rgb
+local NAVY, VIOLET, LILAC, GOLD, LIME, RED = UiKit.NAVY, UiKit.VIOLET, UiKit.LILAC, UiKit.GOLD, UiKit.LIME, UiKit.RED
 local CREAM, WHITE, INK, ORANGE = UiKit.CREAM, UiKit.WHITE, UiKit.INK, UiKit.ORANGE
-local FONT_BOLD, FONT_MEDIUM, FONT_HEAVY = UiKit.FONT_BOLD, UiKit.FONT_MEDIUM, UiKit.FONT_HEAVY
+local PANEL_TOP, PANEL_BOTTOM = UiKit.PANEL_TOP, UiKit.PANEL_BOTTOM
+local FONT_HEAVY, FONT_BOLD, FONT_MEDIUM = UiKit.FONT_HEAVY, UiKit.FONT_BOLD, UiKit.FONT_MEDIUM
 
-local LAYOUT_SIZE = Vector2.new(920, 456)
-local HISTORY_LINES = 4
-local LINE_TIME = 2.1 -- seconds each commentary line gets before the next
-local TYPE_TIME = 0.35 -- the newest line types itself in
-local FADE_TIME = 0.45 -- studio <-> pitch
-local MOMENT_BANNER_TIME = 1.7
+local FEED_SLOTS = 6
+local LINE_TIME = 1.6 -- seconds per commentary line at normal speed
+local CHANCE_LINE_TIME = 1.15 -- the chance's build-up reads faster
+local GOAL_LINE_TIME = 2.6
+local AUTO_PLAY = 9 -- seconds before the PLAY button presses itself
 local TACTIC_HOLD = 1.5 -- after a tap, the server's echo of the old tactic doesn't undo it
-local GOAL_KEYS = { OPP_GOAL = true, TEAM_GOAL = true, YOU_GOAL = true, ASSIST_GOAL = true, HEADER_GOAL = true }
+local FADE_TIME = 0.4
+local GREEN = rgb(64, 200, 72)
+local GREEN_DARK = rgb(22, 120, 40)
+local KIND_STYLE = {
+	NEUTRAL = { from = rgb(96, 58, 196), to = rgb(52, 26, 120), text = WHITE },
+	ME = { from = rgb(255, 214, 74), to = ORANGE, text = INK },
+	GOAL = { from = rgb(255, 236, 140), to = GOLD, text = INK },
+	CONCEDE = { from = rgb(255, 92, 120), to = rgb(170, 18, 52), text = WHITE },
+}
 
 local MatchHud = {}
 MatchHud.__index = MatchHud
+
+---------------------------------------------------------------- small builders
+
+-- Text that fills its box, between minSize and maxSize.
+local function label(props: { [string]: any }, maxSize: number, minSize: number?): TextLabel
+	props.TextScaled = true
+	props.FontFace = props.FontFace or FONT_HEAVY
+	local l = text(props)
+	create("UITextSizeConstraint", { MaxTextSize = maxSize, MinTextSize = minSize or 8, Parent = l })
+	return l
+end
+
+local function box(props: { [string]: any }): Frame
+	props.BackgroundTransparency = 1
+	return frame(props)
+end
+
+local function gradient(parent: Instance, from: Color3, to: Color3, rotation: number?)
+	return create("UIGradient", { Color = ColorSequence.new(from, to), Rotation = rotation or 90, Parent = parent })
+end
+
+-- Readable bar colour from a club colour: dark enough for white text.
+local function teamColors(color: Color3): (Color3, Color3)
+	local luminance = 0.3 * color.R + 0.59 * color.G + 0.11 * color.B
+	local base = if luminance > 0.62 then color:Lerp(INK, 0.55) elseif luminance > 0.45 then color:Lerp(INK, 0.3) else color
+	return base:Lerp(WHITE, 0.12), base:Lerp(INK, 0.35)
+end
+
+-- Chunky button with a lip (the pixel-kit look), sized by scale. style: gold | violet | green.
+local BUTTON_STYLES = {
+	gold = { face = { rgb(255, 214, 74), ORANGE }, lip = UiKit.LIP, text = INK },
+	violet = { face = { rgb(150, 110, 255), VIOLET }, lip = rgb(40, 16, 96), text = CREAM },
+	green = { face = { rgb(130, 236, 96), GREEN }, lip = GREEN_DARK, text = WHITE },
+	dark = { face = { PANEL_TOP, PANEL_BOTTOM }, lip = INK, text = CREAM },
+}
+local function button(parent: Instance, props: { [string]: any }, style: string, onActivated: () -> ())
+	local look = BUTTON_STYLES[style]
+	props.BackgroundTransparency = 1
+	props.AutoButtonColor = false
+	props.Text = ""
+	props.Parent = parent
+	local root = create("TextButton", props)
+	local lip = frame({ Name = "Lip", Position = UDim2.new(0, 0, 0, 5), Size = UDim2.new(1, 0, 1, -5), BackgroundColor3 = look.lip, Parent = root })
+	corner(lip, 10)
+	stroke(lip, INK, 2.5)
+	local face = frame({ Name = "Face", Size = UDim2.new(1, 0, 1, -5), BackgroundColor3 = WHITE, Parent = root })
+	corner(face, 10)
+	gradient(face, look.face[1], look.face[2])
+	stroke(face, INK, 2.5)
+	frame({ Name = "Sheen", Position = UDim2.new(0, 6, 0, 3), Size = UDim2.new(1, -12, 0.36, 0), BackgroundColor3 = WHITE, BackgroundTransparency = 0.78, Parent = face })
+	corner(face:FindFirstChild("Sheen") :: Frame, 8)
+	local function press(down: boolean)
+		TweenService:Create(face, TweenInfo.new(0.07), { Position = UDim2.fromOffset(0, if down then 4 else 0) }):Play()
+	end
+	root.MouseButton1Down:Connect(function()
+		press(true)
+	end)
+	root.MouseButton1Up:Connect(function()
+		press(false)
+	end)
+	root.MouseLeave:Connect(function()
+		press(false)
+	end)
+	root.Activated:Connect(onActivated)
+	return root, face, look.text
+end
+
+-- Dark rounded card (the panel look without the outer glow, for nested blocks).
+local function card(props: { [string]: any }, radius: number?, border: Color3?): Frame
+	props.BackgroundColor3 = WHITE
+	local c = frame(props)
+	corner(c, radius or 12)
+	gradient(c, PANEL_TOP, PANEL_BOTTOM)
+	stroke(c, border or VIOLET, 2)
+	return c
+end
+
+---------------------------------------------------------------- construction
 
 function MatchHud.new()
 	local self = setmetatable({}, MatchHud)
 	self.ui = Commentary.ui()
 	self.onEffort = nil :: ((number) -> ())?
 	self.onFocus = nil :: ((string) -> ())?
-	self.onHighBall = nil :: ((boolean) -> ())?
-	self.onFinished = nil :: (() -> ())? -- full-time card closed
-	self.token = 0 -- bumps whenever a new sequence starts, so old timers stop
+	self.onFinished = nil :: (() -> ())?
+	self.token = 0
 	self.minute = 0
-	self.lines = {} :: { { minute: number, text: string, goal: boolean } }
+	self.speed = 1
 	self.effort = 2
 	self.focus = "ATTACK"
 	self.stamina = 100
 	self.tacticAt = -math.huge
-	self.highBall = false
+	self.chapter = {} :: { any }
 	self.names = { home = "", away = "", me = "" }
+	self.momentChips = {}
 
 	local gui = UiKit.screenGui("MatchHud", 4)
 	gui.Enabled = false
 	self.gui = gui
-	self.scaler = UiKit.scaler(gui, LAYOUT_SIZE)
+	-- Pointer-following bits (the strike reticle) use input coordinates: no safe-area insets.
+	local pointer = UiKit.screenGui("MatchPointer", 6)
+	pointer.ScreenInsets = Enum.ScreenInsets.None
+	pointer.Enabled = false
+	self.pointerGui = pointer
 
 	self:_buildBackdrop()
-	self:_buildScoreboard()
 	self:_buildStudio()
-	self:_buildPlayOverlay()
-	self:_buildMoment()
+	self:_buildPlay()
+	self:_buildPopup()
 	self:_buildResult()
 	return self
 end
 
----------------------------------------------------------------- building
-
--- Full-screen studio background: deep violet with a faint pitch drawn on it.
 function MatchHud:_buildBackdrop()
-	local group = create("CanvasGroup", { Name = "Backdrop", Position = UDim2.fromOffset(0, 0), Size = UDim2.fromScale(1, 1), BackgroundColor3 = WHITE, BorderSizePixel = 0, ZIndex = 0, Parent = self.gui })
-	create("UIGradient", { Color = ColorSequence.new(UiKit.PANEL_TOP, NAVY), Rotation = 90, Parent = group })
-	self.backdrop = group
-	local pitch = frame({ Name = "Pitch", AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.56), Size = UDim2.fromScale(0.92, 0.7), BackgroundTransparency = 1, Parent = group })
-	stroke(pitch, GLOW, 2, 0.8)
-	frame({ Name = "Halfway", AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.fromScale(0.5, 0), Size = UDim2.new(0, 2, 1, 0), BackgroundColor3 = GLOW, BackgroundTransparency = 0.8, Parent = pitch })
-	local circle = frame({ Name = "Circle", AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromScale(0.22, 0.22), BackgroundTransparency = 1, Parent = pitch })
-	create("UIAspectRatioConstraint", { AspectRatio = 1, Parent = circle })
-	corner(circle, 999)
-	stroke(circle, GLOW, 2, 0.8)
-	for i, anchor in { 0, 1 } do
-		local box = frame({ Name = "Box" .. i, AnchorPoint = Vector2.new(anchor, 0.5), Position = UDim2.fromScale(anchor, 0.5), Size = UDim2.fromScale(0.14, 0.5), BackgroundTransparency = 1, Parent = pitch })
-		stroke(box, GLOW, 2, 0.8)
-	end
+	-- Over the blurred stadium: darker at the edges so the panels read.
+	local backdrop = frame({ Name = "Backdrop", Position = UDim2.fromOffset(-200, -200), Size = UDim2.new(1, 400, 1, 400), BackgroundColor3 = WHITE, BackgroundTransparency = 0.18, ZIndex = 0, Parent = self.gui })
+	create("UIGradient", {
+		Color = ColorSequence.new(rgb(30, 12, 64), INK),
+		Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.25), NumberSequenceKeypoint.new(0.5, 0.45), NumberSequenceKeypoint.new(1, 0.15) }),
+		Rotation = 90,
+		Parent = backdrop,
+	})
+	self.backdrop = backdrop
 end
 
-function MatchHud:_buildScoreboard()
-	local holder = frame({ Name = "Scoreboard", AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 8), Size = UDim2.fromOffset(470, 70), BackgroundTransparency = 1, ZIndex = 2, Parent = self.gui })
-	self.scaler:add(holder)
-	local body = UiKit.panel({ Name = "Body", Size = UDim2.fromScale(1, 1), Parent = holder }, 12)
-	self.sides = {}
+-- Broadcast scoreboard: team bars in club colours, the score, the minute in the middle.
+function MatchHud:_scoreboard(parent: Instance, props: { [string]: any })
+	local root = box(props)
+	root.Parent = parent
+	local refs = { sides = {} }
 	for i, anchor in { 0, 1 } do
-		local side = frame({ Name = "Side" .. i, AnchorPoint = Vector2.new(anchor, 0), Position = UDim2.new(anchor, if i == 1 then 10 else -10, 0, 8), Size = UDim2.fromOffset(170, 54), BackgroundTransparency = 1, Parent = body })
-		local crest = frame({ Name = "Crest", AnchorPoint = Vector2.new(anchor, 0.5), Position = UDim2.fromScale(anchor, 0.5), Size = UDim2.fromOffset(44, 44), BackgroundTransparency = 1, Parent = side })
-		local name = text({
-			Name = "ClubName",
-			AnchorPoint = Vector2.new(anchor, 0),
-			Position = UDim2.new(anchor, if i == 1 then 52 else -52, 0, 0),
-			Size = UDim2.new(1, -56, 1, 0),
+		local bar = frame({ Name = "Team" .. i, AnchorPoint = Vector2.new(anchor, 0.5), Position = UDim2.fromScale(anchor, 0.5), Size = UDim2.fromScale(0.39, 0.78), BackgroundColor3 = WHITE, Parent = root })
+		corner(bar, 10)
+		stroke(bar, INK, 2.5)
+		local grad = gradient(bar, WHITE, WHITE, 90)
+		local crest = box({ Name = "Crest", AnchorPoint = Vector2.new(anchor, 0.5), Position = UDim2.new(anchor, if i == 1 then 6 else -6, 0.5, 0), Size = UDim2.fromScale(1, 1.18), Parent = bar })
+		create("UIAspectRatioConstraint", { AspectRatio = 1, Parent = crest })
+		local name = label({
+			Name = "Name",
+			AnchorPoint = Vector2.new(anchor, 0.5),
+			Position = UDim2.new(anchor, if i == 1 then 0 else 0, 0.5, 0),
+			Size = UDim2.new(0.66, 0, 0.62, 0),
 			Text = "",
-			TextSize = 15,
-			TextWrapped = true,
-			TextXAlignment = if i == 1 then Enum.TextXAlignment.Left else Enum.TextXAlignment.Right,
-			Parent = side,
-		})
-		outline(name, 1.5)
-		self.sides[i] = { crest = crest, name = name }
+			TextColor3 = WHITE,
+			TextXAlignment = Enum.TextXAlignment.Center,
+			Parent = bar,
+		}, 26, 10)
+		name.Position = UDim2.fromScale(if i == 1 then 0.56 else 0.44, 0.5)
+		name.AnchorPoint = Vector2.new(0.5, 0.5)
+		outline(name, 2)
+		refs.sides[i] = { bar = bar, grad = grad, crest = crest, name = name }
 	end
-	local scoreText, scoreShadow = UiKit.bigText({ Name = "Score", Text = "0 : 0", TextSize = 34, TextColor3 = WHITE, TextXAlignment = Enum.TextXAlignment.Center, AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 4), Size = UDim2.fromOffset(120, 38), Parent = body }, 3, Vector2.new(0, 3))
-	self.scoreText, self.scoreShadow = scoreText, scoreShadow
-	self.scorePop = create("UIScale", { Parent = scoreText })
-	local chip = frame({ Name = "Minute", AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.new(0.5, 0, 1, -5), Size = UDim2.fromOffset(58, 20), BackgroundColor3 = NAVY, Parent = body })
-	corner(chip, 6)
-	stroke(chip, GOLD, 1.5)
-	self.minuteText = text({ Size = UDim2.fromScale(1, 1), Text = "0'", TextSize = 13, TextColor3 = GOLD, TextXAlignment = Enum.TextXAlignment.Center, Parent = chip })
-end
-
--- Horizontal bar: returns the fill frame and the label on it.
-local function bar(parent: Instance, props: { [string]: any }, color: Color3): (Frame, Frame, TextLabel)
-	local track = frame(props)
-	track.BackgroundColor3 = INK
-	corner(track, 8)
-	stroke(track, INK, 2)
-	local fill = frame({ Name = "Fill", Size = UDim2.fromScale(1, 1), BackgroundColor3 = color, Parent = track })
-	corner(fill, 8)
-	create("UIGradient", { Color = ColorSequence.new(WHITE, Color3.fromRGB(200, 200, 200)), Rotation = 90, Parent = fill })
-	local label = text({ Name = "Label", Size = UDim2.fromScale(1, 1), Text = "", TextSize = 13, TextXAlignment = Enum.TextXAlignment.Center, ZIndex = 3, Parent = track })
-	outline(label, 1.5)
-	track.Parent = parent
-	return track, fill, label
+	local middle = frame({ Name = "Middle", AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromScale(0.21, 1), BackgroundColor3 = NAVY, Parent = root })
+	corner(middle, 12)
+	stroke(middle, GOLD, 2.5)
+	gradient(middle, rgb(40, 22, 84), NAVY)
+	for i, anchor in { 0, 1 } do
+		local goals = label({ Name = "Goals" .. i, AnchorPoint = Vector2.new(anchor, 0.5), Position = UDim2.fromScale(anchor, 0.5), Size = UDim2.fromScale(0.3, 0.8), Text = "0", TextColor3 = WHITE, TextXAlignment = Enum.TextXAlignment.Center, Parent = middle }, 44, 12)
+		outline(goals, 2.5)
+		refs["goals" .. i] = goals
+	end
+	local chip = frame({ Name = "Minute", AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromScale(0.38, 0.62), BackgroundColor3 = WHITE, Parent = middle })
+	corner(chip, 8)
+	stroke(chip, INK, 2)
+	gradient(chip, WHITE, rgb(205, 205, 220))
+	refs.minute = label({ Size = UDim2.fromScale(1, 0.9), Position = UDim2.fromScale(0, 0.05), Text = "0'", TextColor3 = INK, TextXAlignment = Enum.TextXAlignment.Center, Parent = chip }, 24, 9)
+	refs.pop = create("UIScale", { Parent = middle })
+	return refs
 end
 
 function MatchHud:_buildStudio()
 	local ui = self.ui
-	-- Anchored to the bottom so on short phone screens it never runs into the scoreboard.
-	local holder = frame({ Name = "Studio", AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.new(0.5, 0, 1, -8), Size = UDim2.fromOffset(900, 348), BackgroundTransparency = 1, ZIndex = 2, Parent = self.gui })
-	self.scaler:add(holder)
-	self.studio = holder
+	local studio = box({ Name = "Studio", Size = UDim2.fromScale(1, 1), ZIndex = 2, Parent = self.gui })
+	create("UIPadding", { PaddingLeft = UDim.new(0.012, 0), PaddingRight = UDim.new(0.012, 0), PaddingTop = UDim.new(0.015, 0), PaddingBottom = UDim.new(0.02, 0), Parent = studio })
+	self.studio = studio
 
-	-- Commentator: who is talking, the newest line big, the last few above it.
-	local feed = UiKit.panel({ Name = "Commentator", Size = UDim2.fromOffset(580, 300), Parent = holder }, 14)
-	local mic = frame({ Name = "Mic", Position = UDim2.fromOffset(14, 12), Size = UDim2.fromOffset(46, 46), BackgroundColor3 = VIOLET, Parent = feed })
-	corner(mic, 999)
-	stroke(mic, GOLD, 2)
-	text({ Size = UDim2.fromScale(1, 1), Text = "🎙", TextSize = 24, TextXAlignment = Enum.TextXAlignment.Center, Parent = mic })
-	local who = text({ Name = "Who", Position = UDim2.fromOffset(70, 12), Size = UDim2.fromOffset(300, 22), Text = ui.Commentator, TextSize = 16, FontFace = FONT_HEAVY, TextColor3 = LILAC, Parent = feed })
+	-- Header: commentator badge, scoreboard, speed.
+	local header = box({ Name = "Header", Size = UDim2.fromScale(1, 0.13), Parent = studio })
+	local mic = frame({ Name = "Mic", Size = UDim2.fromScale(0.2, 1), BackgroundColor3 = WHITE, Parent = header })
+	corner(mic, 12)
+	gradient(mic, PANEL_TOP, PANEL_BOTTOM)
+	stroke(mic, VIOLET, 2)
+	local micIcon = frame({ Name = "Icon", AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 6, 0.5, 0), Size = UDim2.fromScale(0.8, 0.8), BackgroundColor3 = WHITE, Parent = mic })
+	create("UIAspectRatioConstraint", { AspectRatio = 1, Parent = micIcon })
+	corner(micIcon)
+	gradient(micIcon, rgb(150, 110, 255), VIOLET)
+	stroke(micIcon, GOLD, 2)
+	label({ Size = UDim2.fromScale(1, 1), Text = "🎙", TextXAlignment = Enum.TextXAlignment.Center, Parent = micIcon }, 30)
+	local who = label({ Name = "Who", Position = UDim2.fromScale(0.36, 0.14), Size = UDim2.fromScale(0.6, 0.38), Text = ui.Commentator, TextColor3 = LILAC, Parent = mic }, 18, 8)
 	outline(who, 1.5)
-	local live = frame({ Name = "Live", Position = UDim2.fromOffset(70, 38), Size = UDim2.fromOffset(52, 18), BackgroundColor3 = RED, Parent = feed })
-	corner(live, 5)
-	self.liveDot = text({ Size = UDim2.fromScale(1, 1), Text = "● " .. ui.Live, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Center, Parent = live })
-	UiKit.slashes(feed, UDim2.new(1, -60, 0, 12), 20, GLOW)
+	local live = frame({ Name = "Live", Position = UDim2.fromScale(0.36, 0.56), Size = UDim2.fromScale(0.34, 0.3), BackgroundColor3 = RED, Parent = mic })
+	corner(live, 6)
+	self.liveText = label({ Size = UDim2.fromScale(1, 1), Text = "● " .. ui.Live, TextXAlignment = Enum.TextXAlignment.Center, Parent = live }, 14, 7)
 
-	self.history = {}
-	for i = 1, HISTORY_LINES do
-		local y = 66 + (i - 1) * 26
-		local minute = text({ Name = "Minute" .. i, Position = UDim2.fromOffset(16, y), Size = UDim2.fromOffset(40, 24), Text = "", TextSize = 13, TextColor3 = GOLD, Parent = feed })
-		local label = text({ Name = "Line" .. i, Position = UDim2.fromOffset(58, y), Size = UDim2.new(1, -74, 0, 24), Text = "", TextSize = 14, FontFace = FONT_MEDIUM, TextTruncate = Enum.TextTruncate.AtEnd, Parent = feed })
-		self.history[i] = { label = label, minute = minute }
-	end
-	local current = frame({ Name = "Current", Position = UDim2.fromOffset(12, 176), Size = UDim2.new(1, -24, 0, 112), BackgroundColor3 = NAVY, Parent = feed })
-	corner(current, 10)
-	stroke(current, GLOW, 2, 0.3)
-	self.currentMinute = text({ Name = "Minute", Position = UDim2.fromOffset(12, 8), Size = UDim2.fromOffset(60, 30), Text = "", TextSize = 24, FontFace = FONT_HEAVY, TextColor3 = GOLD, Parent = current })
-	outline(self.currentMinute, 2)
-	self.currentText = text({ Name = "Text", Position = UDim2.fromOffset(78, 6), Size = UDim2.new(1, -90, 1, -12), Text = "", TextSize = 22, FontFace = FONT_BOLD, TextWrapped = true, TextYAlignment = Enum.TextYAlignment.Center, Parent = current })
-	outline(self.currentText, 2)
-	self.currentPop = create("UIScale", { Parent = current })
+	self.board = self:_scoreboard(header, { Name = "Scoreboard", AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.fromScale(0.5, 0), Size = UDim2.fromScale(0.56, 1) })
 
-	-- Your player: stamina and the two tactics.
-	local card = UiKit.panel({ Name = "Player", Position = UDim2.fromOffset(596, 0), Size = UDim2.fromOffset(304, 300), Parent = holder }, 14, GOLD)
-	local title = text({ Name = "Title", Position = UDim2.fromOffset(14, 10), Size = UDim2.new(1, -28, 0, 16), Text = ui.YourPlayer, TextSize = 12, FontFace = FONT_BOLD, TextColor3 = LILAC, Parent = card })
-	outline(title, 1)
-	self.playerName = text({ Name = "Name", Position = UDim2.fromOffset(14, 26), Size = UDim2.new(1, -28, 0, 26), Text = "", TextSize = 22, FontFace = FONT_HEAVY, TextColor3 = GOLD, TextTruncate = Enum.TextTruncate.AtEnd, Parent = card })
-	outline(self.playerName, 2)
+	local speed, speedFace = button(header, { Name = "Speed", AnchorPoint = Vector2.new(1, 0), Position = UDim2.fromScale(1, 0), Size = UDim2.fromScale(0.2, 1) }, "dark", function()
+		self:_toggleSpeed()
+	end)
+	self.speedLabel = label({ Size = UDim2.fromScale(1, 1), Text = "»  ×1", TextColor3 = CREAM, TextXAlignment = Enum.TextXAlignment.Center, Parent = speedFace }, 26, 10)
+	outline(self.speedLabel, 2)
+	self.speedButton = speed
 
-	local staminaLabel = text({ Position = UDim2.fromOffset(14, 58), Size = UDim2.new(1, -28, 0, 16), Text = "⚡ " .. ui.Stamina, TextSize = 12, FontFace = FONT_BOLD, Parent = card })
-	outline(staminaLabel, 1)
-	local _, fill, label = bar(card, { Name = "Stamina", Position = UDim2.fromOffset(14, 76), Size = UDim2.new(1, -28, 0, 24) }, LIME)
-	self.staminaFill, self.staminaLabel = fill, label
+	local top, bottomGap = 0.155, 0.0
+	-- Left: your player and energy.
+	local left = box({ Name = "Left", Position = UDim2.fromScale(0, top), Size = UDim2.fromScale(0.2, 1 - top - bottomGap), Parent = studio })
+	self:_buildPlayerCard(left)
+	-- Centre: the feed.
+	local feed = box({ Name = "Feed", Position = UDim2.fromScale(0.215, top), Size = UDim2.fromScale(0.57, 0.715), Parent = studio })
+	self:_buildFeed(feed)
+	-- Right: tactics and the match so far.
+	local right = box({ Name = "Right", AnchorPoint = Vector2.new(1, 0), Position = UDim2.fromScale(1, top), Size = UDim2.fromScale(0.2, 1 - top - bottomGap), Parent = studio })
+	self:_buildTactics(right)
 
-	local effortLabel = text({ Position = UDim2.fromOffset(14, 110), Size = UDim2.new(1, -28, 0, 16), Text = ui.Effort, TextSize = 12, FontFace = FONT_BOLD, Parent = card })
-	outline(effortLabel, 1)
-	self.effortButtons = {}
-	for n = 1, 3 do
-		local button = UiKit.button(card, { Name = "Effort" .. n, Position = UDim2.fromOffset(14 + (n - 1) * 94, 128), Size = UDim2.fromOffset(86, 44), TextSize = 17 }, string.rep("❤", n), function()
-			self:_pickEffort(n)
-		end, "secondary")
-		self.effortButtons[n] = self:_selectable(button)
-	end
-	local effortHint = text({ Position = UDim2.fromOffset(14, 174), Size = UDim2.new(1, -28, 0, 28), Text = ui.EffortHint, TextSize = 11, FontFace = FONT_MEDIUM, TextColor3 = LILAC, TextWrapped = true, Parent = card })
-	outline(effortHint, 1)
-
-	local focusLabel = text({ Position = UDim2.fromOffset(14, 204), Size = UDim2.new(1, -28, 0, 16), Text = ui.Focus, TextSize = 12, FontFace = FONT_BOLD, Parent = card })
-	outline(focusLabel, 1)
-	self.focusButtons = {}
-	for i, focus in { "ATTACK", "DEFENSE" } do
-		local caption = if focus == "ATTACK" then "⚔ " .. ui.Attack else "🛡 " .. ui.Defense
-		local button = UiKit.button(card, { Name = focus, Position = UDim2.fromOffset(14 + (i - 1) * 142, 222), Size = UDim2.fromOffset(134, 44), TextSize = 16 }, caption, function()
-			self:_pickFocus(focus)
-		end, "secondary")
-		self.focusButtons[focus] = self:_selectable(button)
-	end
-	local focusHint = text({ Position = UDim2.fromOffset(14, 268), Size = UDim2.new(1, -28, 0, 28), Text = ui.FocusHint, TextSize = 11, FontFace = FONT_MEDIUM, TextColor3 = LILAC, TextWrapped = true, Parent = card })
-	outline(focusHint, 1)
-
-	-- Timeline: 0' to 90', half-time mark, a gold dot per goal.
-	local track, timeFill = bar(holder, { Name = "Timeline", Position = UDim2.fromOffset(0, 312), Size = UDim2.new(1, 0, 0, 16) }, GLOW)
-	self.timeline, self.timeFill = track, timeFill
-	frame({ Name = "Half", AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.new(0, 3, 1, 8), BackgroundColor3 = CREAM, ZIndex = 4, Parent = track })
-	for i, label in { "0'", "45'", "90'" } do
-		local t = text({ AnchorPoint = Vector2.new((i - 1) / 2, 0), Position = UDim2.new((i - 1) / 2, 0, 1, 4), Size = UDim2.fromOffset(40, 16), Text = label, TextSize = 12, TextColor3 = LILAC, TextXAlignment = if i == 1 then Enum.TextXAlignment.Left elseif i == 3 then Enum.TextXAlignment.Right else Enum.TextXAlignment.Center, Parent = track })
-		outline(t, 1)
-	end
+	-- PLAY: under the feed when your moment comes.
+	local play, playFace = button(studio, { Name = "Play", AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.fromScale(0.5, 1), Size = UDim2.fromScale(0.36, 0.115), Visible = false, ZIndex = 5 }, "green", function()
+		self:_pressPlay()
+	end)
+	self.playLabel = label({ Size = UDim2.fromScale(0.9, 0.8), AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Text = "▶  " .. ui.Play, TextColor3 = WHITE, TextXAlignment = Enum.TextXAlignment.Center, Parent = playFace }, 34, 12)
+	outline(self.playLabel, 2.5)
+	self.playPop = create("UIScale", { Parent = play })
+	self.playButton = play
+	-- When there's no moment the strip under the feed says what's on.
+	local status = frame({ Name = "Status", AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.fromScale(0.5, 1), Size = UDim2.fromScale(0.57, 0.1), BackgroundColor3 = WHITE, Parent = studio })
+	corner(status, 10)
+	gradient(status, PANEL_TOP, PANEL_BOTTOM)
+	stroke(status, VIOLET, 2)
+	self.statusText = label({ AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromScale(0.94, 0.6), Text = "", TextColor3 = LILAC, FontFace = FONT_BOLD, TextXAlignment = Enum.TextXAlignment.Center, Parent = status }, 20, 9)
+	self.statusBar = status
 end
 
--- A tactic button with a gold frame and a check when picked.
-function MatchHud:_selectable(button)
-	local ring = frame({ Name = "Picked", Position = UDim2.fromOffset(-4, -4), Size = UDim2.new(1, 8, 1, 8), BackgroundTransparency = 1, Visible = false, ZIndex = 5, Parent = button.button })
-	corner(ring, 12)
-	stroke(ring, GOLD, 3)
-	return { button = button, ring = ring }
-end
-
-function MatchHud:_buildPlayOverlay()
+function MatchHud:_buildPlayerCard(column: Frame)
 	local ui = self.ui
-	local holder = frame({ Name = "Play", AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 84), Size = UDim2.fromOffset(380, 56), BackgroundTransparency = 1, Visible = false, ZIndex = 2, Parent = self.gui })
-	self.scaler:add(holder)
-	self.playHolder = holder
-	local warn = text({ Name = "PressureLabel", Size = UDim2.new(1, 0, 0, 18), Text = "⚠ " .. ui.Pressure, TextSize = 13, FontFace = FONT_HEAVY, TextColor3 = UiKit.RED_LIGHT, TextXAlignment = Enum.TextXAlignment.Center, Parent = holder })
-	outline(warn, 1.5)
-	self.pressureLabel = warn
-	local track, fill = bar(holder, { Name = "Pressure", Position = UDim2.fromOffset(0, 20), Size = UDim2.new(1, 0, 0, 14) }, ORANGE)
-	self.pressureTrack, self.pressureFill = track, fill
-	local _, sFill, sLabel = bar(holder, { Name = "Stamina", AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 38), Size = UDim2.new(0.6, 0, 0, 14) }, LIME)
-	self.playStaminaFill, self.playStaminaLabel = sFill, sLabel
-	sLabel.TextSize = 10
+	local panel = UiKit.panel({ Name = "Player", Size = UDim2.fromScale(1, 0.72), Parent = column }, 14, GOLD)
+	local title = label({ Position = UDim2.fromScale(0.08, 0.035), Size = UDim2.fromScale(0.84, 0.075), Text = ui.YourPlayer, TextColor3 = LILAC, Parent = panel }, 16, 8)
+	outline(title, 1.5)
+	-- Shirt: club colours, the number big, the face if the texture loaded.
+	local shirt = frame({ Name = "Shirt", AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.fromScale(0.5, 0.13), Size = UDim2.fromScale(0.84, 0.46), BackgroundColor3 = WHITE, Parent = panel })
+	corner(shirt, 12)
+	stroke(shirt, INK, 2.5)
+	self.shirtGradient = gradient(shirt, WHITE, WHITE, 115)
+	local face = create("ImageLabel", { Name = "Face", AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.fromScale(0.06, 0.5), Size = UDim2.fromScale(0.42, 0.8), BackgroundTransparency = 1, ScaleType = Enum.ScaleType.Fit, Visible = false, Parent = shirt })
+	face:SetAttribute("Image", "PlayerMain/HeadFront")
+	face:AddTag("NfsImage") -- ImageLoader fills it and makes it visible
+	self.shirtNumber = label({ Name = "Number", AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.46), Size = UDim2.fromScale(0.8, 0.8), Text = "10", TextColor3 = WHITE, TextXAlignment = Enum.TextXAlignment.Center, Parent = shirt }, 80, 14)
+	outline(self.shirtNumber, 3)
+	-- The number sits beside the face once the face has loaded, centred otherwise.
+	face:GetPropertyChangedSignal("Visible"):Connect(function()
+		self.shirtNumber.Position = UDim2.fromScale(if face.Visible then 0.72 else 0.5, 0.46)
+		self.shirtNumber.Size = UDim2.fromScale(if face.Visible then 0.5 else 0.8, 0.8)
+	end)
+	self.playerName = label({ Name = "Name", AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.fromScale(0.5, 0.61), Size = UDim2.fromScale(0.9, 0.1), Text = "", TextColor3 = GOLD, TextXAlignment = Enum.TextXAlignment.Center, Parent = panel }, 26, 9)
+	outline(self.playerName, 2)
+	-- Rating and the three numbers that matter.
+	local rating = frame({ Name = "Rating", AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.fromScale(0.5, 0.725), Size = UDim2.fromScale(0.84, 0.1), BackgroundColor3 = NAVY, Parent = panel })
+	corner(rating, 8)
+	stroke(rating, GOLD, 2)
+	self.ratingText = label({ AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromScale(0.92, 0.72), Text = ui.Rating .. "  6.0", TextColor3 = GOLD, TextXAlignment = Enum.TextXAlignment.Center, Parent = rating }, 20, 8)
+	self.statText = {}
+	for i, key in { "Goals", "Assists", "Shots" } do
+		local cell = box({ Name = key, Position = UDim2.fromScale(0.08 + (i - 1) * 0.28, 0.84), Size = UDim2.fromScale(0.28, 0.14), Parent = panel })
+		local value = label({ Size = UDim2.fromScale(1, 0.6), Text = "0", TextColor3 = CREAM, TextXAlignment = Enum.TextXAlignment.Center, Parent = cell }, 26, 10)
+		outline(value, 2)
+		label({ Position = UDim2.fromScale(0, 0.62), Size = UDim2.fromScale(1, 0.34), Text = self.ui[key], FontFace = FONT_BOLD, TextColor3 = LILAC, TextXAlignment = Enum.TextXAlignment.Center, Parent = cell }, 12, 6)
+		self.statText[key] = value
+	end
 
-	-- High ball switch, right edge: on = your next pass is lofted (a cross).
-	local side = frame({ Name = "HighBall", AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -14, 0.55, 0), Size = UDim2.fromOffset(150, 60), BackgroundTransparency = 1, Visible = false, ZIndex = 3, Parent = self.gui })
-	self.scaler:add(side)
-	self.highHolder = side
-	self.highButton = UiKit.button(side, { Name = "Toggle", Size = UDim2.fromOffset(150, 60), TextSize = 18 }, "⤴ " .. ui.HighBall, function()
-		self:setHighBall(not self.highBall)
-		if self.onHighBall then
-			self.onHighBall(self.highBall)
-		end
-	end, "secondary")
-	self.highSelect = self:_selectable(self.highButton)
+	-- Energy: heart and bar, as in the reference.
+	local energy = card({ Name = "Energy", AnchorPoint = Vector2.new(0, 1), Position = UDim2.fromScale(0, 1), Size = UDim2.fromScale(1, 0.24) }, 12, rgb(255, 92, 120))
+	energy.Parent = column
+	local heart = label({ Name = "Heart", AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.fromScale(0.03, 0.56), Size = UDim2.fromScale(0.3, 0.8), Text = "❤", TextColor3 = rgb(255, 60, 90), TextXAlignment = Enum.TextXAlignment.Center, Parent = energy }, 48, 12)
+	outline(heart, 2)
+	self.heartPop = create("UIScale", { Parent = heart })
+	label({ Position = UDim2.fromScale(0.34, 0.1), Size = UDim2.fromScale(0.62, 0.28), Text = ui.Energy, TextColor3 = LILAC, Parent = energy }, 16, 7)
+	local track = frame({ Name = "Track", Position = UDim2.fromScale(0.34, 0.46), Size = UDim2.fromScale(0.6, 0.38), BackgroundColor3 = INK, Parent = energy })
+	corner(track, 8)
+	stroke(track, INK, 2)
+	local fill = frame({ Name = "Fill", Size = UDim2.fromScale(1, 1), BackgroundColor3 = WHITE, Parent = track })
+	corner(fill, 8)
+	self.energyGradient = gradient(fill, rgb(150, 255, 110), rgb(50, 190, 60))
+	self.energyFill = fill
+	self.energyText = label({ Size = UDim2.fromScale(1, 0.86), Position = UDim2.fromScale(0, 0.07), Text = "100%", TextColor3 = WHITE, TextXAlignment = Enum.TextXAlignment.Center, ZIndex = 3, Parent = track }, 18, 7)
+	outline(self.energyText, 2)
 end
 
-function MatchHud:_buildMoment()
-	local holder = frame({ Name = "Moment", AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(500, 150), BackgroundTransparency = 1, Visible = false, ZIndex = 8, Parent = self.gui })
-	self.scaler:add(holder)
-	self.momentHolder = holder
-	local body = UiKit.panel({ Name = "Body", AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromScale(1, 1), Parent = holder }, 14, GOLD)
-	self.momentPop = create("UIScale", { Parent = body })
-	UiKit.slashes(body, UDim2.new(1, -60, 0, 10), 20, GLOW)
-	UiKit.slashes(body, UDim2.fromOffset(14, 10), 20, GLOW)
-	local title = UiKit.bigText({ Name = "Title", Text = self.ui.YourMoment, TextSize = 34, TextColor3 = GOLD, TextXAlignment = Enum.TextXAlignment.Center, Position = UDim2.fromOffset(16, 10), Size = UDim2.new(1, -32, 0, 40), Parent = body }, 3, Vector2.new(2, 3))
-	title.ZIndex = 2
-	self.momentCount = text({ Name = "Count", Position = UDim2.fromOffset(16, 54), Size = UDim2.new(1, -32, 0, 18), Text = "", TextSize = 13, FontFace = FONT_BOLD, TextColor3 = LILAC, TextXAlignment = Enum.TextXAlignment.Center, Parent = body })
-	outline(self.momentCount, 1)
-	self.momentText = text({ Name = "Text", Position = UDim2.fromOffset(20, 76), Size = UDim2.new(1, -40, 0, 60), Text = "", TextSize = 18, FontFace = FONT_BOLD, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Center, Parent = body })
-	outline(self.momentText, 1.5)
+function MatchHud:_buildFeed(holder: Frame)
+	local panel = UiKit.panel({ Name = "Panel", Size = UDim2.fromScale(1, 1), Parent = holder }, 14)
+	self.feedPanel = panel
+	local list = box({ Name = "Slots", Position = UDim2.fromScale(0.025, 0.04), Size = UDim2.fromScale(0.95, 0.92), Parent = panel })
+	self.slots = {}
+	local gap = 0.022
+	local height = (1 - gap * (FEED_SLOTS - 1)) / FEED_SLOTS
+	for i = 1, FEED_SLOTS do
+		local slot = box({ Name = "Slot" .. i, Position = UDim2.fromScale(0, (i - 1) * (height + gap)), Size = UDim2.fromScale(1, height), Parent = list })
+		-- The empty board: faint outlines waiting to be filled.
+		local empty = frame({ Name = "Empty", Size = UDim2.fromScale(1, 1), BackgroundColor3 = INK, BackgroundTransparency = 0.55, Parent = slot })
+		corner(empty, 10)
+		stroke(empty, VIOLET, 1.5, 0.55)
+		local bar = frame({ Name = "Bar", Size = UDim2.fromScale(1, 1), BackgroundColor3 = WHITE, Visible = false, Parent = slot })
+		corner(bar, 10)
+		local barStroke = stroke(bar, INK, 2.5)
+		local grad = gradient(bar, WHITE, WHITE)
+		frame({ Name = "Sheen", Position = UDim2.new(0, 8, 0, 3), Size = UDim2.new(1, -16, 0.32, 0), BackgroundColor3 = WHITE, BackgroundTransparency = 0.8, Parent = bar })
+		corner(bar:FindFirstChild("Sheen") :: Frame, 6)
+		-- Stopwatch with the minute on the first line of a chance (and on goals).
+		local watch = frame({ Name = "Watch", AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, -4, 0.5, 0), Size = UDim2.fromScale(1.25, 1.25), BackgroundColor3 = WHITE, Visible = false, ZIndex = 3, Parent = bar })
+		create("UIAspectRatioConstraint", { AspectRatio = 1, Parent = watch })
+		corner(watch)
+		gradient(watch, WHITE, rgb(190, 190, 205))
+		stroke(watch, INK, 2.5)
+		local watchText = label({ AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.54), Size = UDim2.fromScale(0.78, 0.5), Text = "", TextColor3 = INK, TextXAlignment = Enum.TextXAlignment.Center, ZIndex = 4, Parent = watch }, 22, 7)
+		local line = label({ Name = "Text", AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromScale(0.86, 0.66), Text = "", FontFace = FONT_BOLD, TextXAlignment = Enum.TextXAlignment.Center, TextWrapped = true, ZIndex = 3, Parent = bar }, 22, 9)
+		local lineStroke = outline(line, 1.5)
+		local pop = create("UIScale", { Parent = bar })
+		self.slots[i] = { slot = slot, empty = empty, bar = bar, grad = grad, stroke = barStroke, watch = watch, watchText = watchText, text = line, textStroke = lineStroke, pop = pop, limit = line:FindFirstChildOfClass("UITextSizeConstraint") }
+	end
+	-- One text size for every line (from the bar height); only long lines shrink below it.
+	local function sizeText()
+		local height = self.slots[1].slot.AbsoluteSize.Y
+		if height > 0 then
+			for _, slot in self.slots do
+				slot.limit.MaxTextSize = math.clamp(math.floor(height * 0.4), 10, 24)
+			end
+		end
+	end
+	self.slots[1].slot:GetPropertyChangedSignal("AbsoluteSize"):Connect(sizeText)
+	sizeText()
+end
+
+function MatchHud:_buildTactics(column: Frame)
+	local ui = self.ui
+	local function tacticCard(name: string, y: number, onTap: () -> ())
+		local b, face = button(column, { Name = name, Position = UDim2.fromScale(0, y), Size = UDim2.fromScale(1, 0.25) }, "violet", onTap)
+		local icon = frame({ Name = "Icon", AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.fromScale(0.05, 0.5), Size = UDim2.fromScale(0.7, 0.7), BackgroundColor3 = WHITE, Parent = face })
+		create("UIAspectRatioConstraint", { AspectRatio = 1, Parent = icon })
+		corner(icon)
+		gradient(icon, rgb(130, 236, 96), GREEN)
+		stroke(icon, INK, 2.5)
+		local glyph = label({ Size = UDim2.fromScale(1, 1), Text = "", TextColor3 = WHITE, TextXAlignment = Enum.TextXAlignment.Center, Parent = icon }, 34, 10)
+		outline(glyph, 2)
+		local title = label({ Position = UDim2.fromScale(0.42, 0.12), Size = UDim2.fromScale(0.54, 0.34), Text = "", TextColor3 = WHITE, Parent = face }, 22, 8)
+		outline(title, 2)
+		local value = label({ Position = UDim2.fromScale(0.42, 0.52), Size = UDim2.fromScale(0.54, 0.32), Text = "", TextColor3 = rgb(255, 226, 120), Parent = face }, 18, 7)
+		outline(value, 1.5)
+		return { button = b, glyph = glyph, title = title, value = value }
+	end
+	self.workCard = tacticCard("Work", 0, function()
+		self:_openChooser("WORK")
+	end)
+	self.workCard.glyph.Text = "❤"
+	self.workCard.title.Text = ui.Work
+	self.focusCard = tacticCard("Focus", 0.28, function()
+		self:_openChooser("FOCUS")
+	end)
+	self.focusCard.title.Text = ui.Focus
+
+	-- The match so far: a chip per moment, the timeline with the goals.
+	local summary = card({ Name = "Summary", Position = UDim2.fromScale(0, 0.565), Size = UDim2.fromScale(1, 0.435) }, 12)
+	summary.Parent = column
+	local mTitle = label({ Position = UDim2.fromScale(0.07, 0.05), Size = UDim2.fromScale(0.86, 0.14), Text = ui.Moments, TextColor3 = LILAC, Parent = summary }, 15, 7)
+	outline(mTitle, 1.5)
+	local chips = box({ Name = "Chips", Position = UDim2.fromScale(0.07, 0.21), Size = UDim2.fromScale(0.86, 0.26), Parent = summary })
+	create("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0.025, 0), SortOrder = Enum.SortOrder.LayoutOrder, VerticalAlignment = Enum.VerticalAlignment.Center, Parent = chips })
+	self.chipHolder = chips
+	local tTitle = label({ Position = UDim2.fromScale(0.07, 0.52), Size = UDim2.fromScale(0.86, 0.14), Text = ui.Timeline, TextColor3 = LILAC, Parent = summary }, 15, 7)
+	outline(tTitle, 1.5)
+	local track = frame({ Name = "Timeline", Position = UDim2.fromScale(0.07, 0.72), Size = UDim2.fromScale(0.86, 0.1), BackgroundColor3 = INK, Parent = summary })
+	corner(track, 6)
+	stroke(track, INK, 2)
+	local fill = frame({ Name = "Fill", Size = UDim2.fromScale(0, 1), BackgroundColor3 = WHITE, Parent = track })
+	corner(fill, 6)
+	gradient(fill, rgb(150, 110, 255), VIOLET, 0)
+	frame({ Name = "Half", AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.new(0, 2, 1.6, 0), BackgroundColor3 = CREAM, ZIndex = 3, Parent = track })
+	self.timeline, self.timeFill = track, fill
+	for i, mark in { "0'", "45'", "90'" } do
+		label({ AnchorPoint = Vector2.new((i - 1) / 2, 0), Position = UDim2.new((i - 1) / 2, 0, 1.25, 0), Size = UDim2.fromScale(0.3, 1.3), Text = mark, FontFace = FONT_BOLD, TextColor3 = LILAC, TextXAlignment = if i == 1 then Enum.TextXAlignment.Left elseif i == 3 then Enum.TextXAlignment.Right else Enum.TextXAlignment.Center, Parent = track }, 12, 6)
+	end
+end
+
+function MatchHud:_buildPlay()
+	local ui = self.ui
+	local play = box({ Name = "Play", Size = UDim2.fromScale(1, 1), Visible = false, ZIndex = 2, Parent = self.gui })
+	self.play = play
+	self.miniBoard = self:_scoreboard(play, { Name = "Scoreboard", AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 6), Size = UDim2.fromScale(0.5, 0.095) })
+
+	-- Time before the presser gets there.
+	local timer = box({ Name = "Timer", AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0.115, 4), Size = UDim2.fromScale(0.34, 0.05), Parent = play })
+	local clock = label({ AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.fromScale(0, 0.5), Size = UDim2.fromScale(0.09, 1.3), Text = "⏱", TextColor3 = WHITE, TextXAlignment = Enum.TextXAlignment.Center, Parent = timer }, 30, 10)
+	outline(clock, 2)
+	local track = frame({ Name = "Track", AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.fromScale(1, 0.5), Size = UDim2.fromScale(0.89, 0.62), BackgroundColor3 = INK, Parent = timer })
+	corner(track, 8)
+	stroke(track, INK, 2.5)
+	local fill = frame({ Name = "Fill", Size = UDim2.fromScale(1, 1), BackgroundColor3 = WHITE, Parent = track })
+	corner(fill, 8)
+	self.timerGradient = gradient(fill, rgb(150, 255, 110), rgb(50, 190, 60))
+	self.timerFill = fill
+	self.timer = timer
+
+	-- Hint at the bottom.
+	local hint = frame({ Name = "Hint", AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.new(0.5, 0, 1, -10), Size = UDim2.fromScale(0.58, 0.085), BackgroundColor3 = WHITE, Visible = false, Parent = play })
+	corner(hint, 14)
+	gradient(hint, PANEL_TOP, PANEL_BOTTOM)
+	stroke(hint, GOLD, 2.5)
+	self.hintText = label({ AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromScale(0.94, 0.62), Text = "", FontFace = FONT_BOLD, TextColor3 = WHITE, TextXAlignment = Enum.TextXAlignment.Center, Parent = hint }, 22, 9)
+	outline(self.hintText, 1.5)
+	self.hint = hint
+
+	-- Strike screen: stopwatch bottom-left, how the hit works on the right.
+	local strike = box({ Name = "Strike", Size = UDim2.fromScale(1, 1), Visible = false, Parent = play })
+	self.strike = strike
+	local watch = box({ Name = "Stopwatch", AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0.02, 0, 1, -12), Size = UDim2.fromScale(0.36, 0.085), Parent = strike })
+	local watchIcon = frame({ Name = "Icon", AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.fromScale(0, 0.5), Size = UDim2.fromScale(1.2, 1.2), BackgroundColor3 = WHITE, ZIndex = 3, Parent = watch })
+	create("UIAspectRatioConstraint", { AspectRatio = 1, Parent = watchIcon })
+	corner(watchIcon)
+	gradient(watchIcon, WHITE, rgb(190, 190, 205))
+	stroke(watchIcon, INK, 2.5)
+	label({ Size = UDim2.fromScale(1, 1), Text = "⏱", TextColor3 = INK, TextXAlignment = Enum.TextXAlignment.Center, ZIndex = 4, Parent = watchIcon }, 30)
+	local strikeTrack = frame({ Name = "Track", AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.fromScale(1, 0.5), Size = UDim2.fromScale(0.86, 0.66), BackgroundColor3 = INK, Parent = watch })
+	corner(strikeTrack, 10)
+	stroke(strikeTrack, INK, 2.5)
+	local strikeFill = frame({ Name = "Fill", Size = UDim2.fromScale(1, 1), BackgroundColor3 = WHITE, Parent = strikeTrack })
+	corner(strikeFill, 10)
+	gradient(strikeFill, rgb(120, 220, 255), rgb(30, 130, 230))
+	self.strikeFill = strikeFill
+	local title = label({ AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.fromScale(0.5, 0.13), Size = UDim2.fromScale(0.5, 0.08), Text = ui.StrikeHint, TextColor3 = GOLD, TextXAlignment = Enum.TextXAlignment.Center, Parent = strike }, 40, 14)
+	outline(title, 3)
+	self.strikeTitle = title
+	local legend = card({ Name = "Legend", AnchorPoint = Vector2.new(1, 1), Position = UDim2.new(0.98, 0, 1, -12), Size = UDim2.fromScale(0.27, 0.27) }, 14, GOLD)
+	legend.Parent = strike
+	-- A small ball with the three zones.
+	local ball = frame({ Name = "Ball", AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.fromScale(0.05, 0.5), Size = UDim2.fromScale(0.78, 0.78), BackgroundColor3 = WHITE, Parent = legend })
+	create("UIAspectRatioConstraint", { AspectRatio = 1, Parent = ball })
+	corner(ball)
+	stroke(ball, INK, 2.5)
+	local low = frame({ Name = "Low", AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.fromScale(0.5, 0.64), Size = UDim2.fromScale(0.36, 0.22), BackgroundColor3 = rgb(120, 220, 255), Parent = ball })
+	corner(low, 6)
+	local high = frame({ Name = "High", AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.fromScale(0.5, 0.36), Size = UDim2.fromScale(0.36, 0.22), BackgroundColor3 = LIME, Parent = ball })
+	corner(high, 6)
+	local sideL = frame({ Name = "Side", AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.fromScale(0.08, 0.5), Size = UDim2.fromScale(0.18, 0.3), BackgroundColor3 = GOLD, Parent = ball })
+	corner(sideL, 6)
+	local sideR = frame({ Name = "Side", AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.fromScale(0.92, 0.5), Size = UDim2.fromScale(0.18, 0.3), BackgroundColor3 = GOLD, Parent = ball })
+	corner(sideR, 6)
+	for i, spec in { { ui.StrikeHigh, LIME }, { ui.StrikeSide, GOLD }, { ui.StrikeLow, rgb(120, 220, 255) } } do
+		local l = label({ Position = UDim2.fromScale(0.42, 0.1 + (i - 1) * 0.28), Size = UDim2.fromScale(0.55, 0.22), Text = spec[1], FontFace = FONT_BOLD, TextColor3 = spec[2], Parent = legend }, 15, 7)
+		outline(l, 1.5)
+	end
+	-- Reticle that follows the pointer over the ball.
+	local reticle = box({ Name = "Reticle", AnchorPoint = Vector2.new(0.5, 0.5), Size = UDim2.fromOffset(46, 46), Visible = false, Parent = self.pointerGui })
+	local ring = box({ Size = UDim2.fromScale(1, 1), Parent = reticle })
+	corner(ring)
+	stroke(ring, RED, 3)
+	local dot = frame({ AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(8, 8), BackgroundColor3 = RED, Parent = reticle })
+	corner(dot)
+	self.reticle = reticle
+
+	-- Result banner in the middle of the pitch.
+	local banner, shadow = UiKit.bigText({ Name = "Banner", AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.36), Size = UDim2.fromScale(0.6, 0.16), Text = "", TextColor3 = GOLD, TextXAlignment = Enum.TextXAlignment.Center, Visible = false, Parent = play }, 5, Vector2.new(0, 5), 96)
+	self.banner, self.bannerShadow = banner, shadow
+	self.bannerPop = create("UIScale", { Parent = banner })
+	self.bannerShadowPop = create("UIScale", { Parent = shadow })
+end
+
+function MatchHud:_buildPopup()
+	local root = box({ Name = "Chooser", Size = UDim2.fromScale(1, 1), Visible = false, ZIndex = 8, Parent = self.gui })
+	local dim = create("TextButton", { Name = "Dim", Position = UDim2.fromOffset(-200, -200), Size = UDim2.new(1, 400, 1, 400), BackgroundColor3 = INK, BackgroundTransparency = 0.35, AutoButtonColor = false, Text = "", Parent = root })
+	dim.Activated:Connect(function()
+		self:_closeChooser()
+	end)
+	local panel = UiKit.panel({ Name = "Panel", AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.52), Size = UDim2.fromScale(0.7, 0.62), Parent = root }, 16, GOLD)
+	self.chooserPop = create("UIScale", { Parent = panel })
+	local title, shadow = UiKit.bigText({ Name = "Title", AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.fromScale(0.5, 0.05), Size = UDim2.fromScale(0.8, 0.16), Text = "", TextColor3 = GOLD, TextXAlignment = Enum.TextXAlignment.Center, Parent = panel }, 3, Vector2.new(0, 3), 40)
+	self.chooserTitle, self.chooserShadow = title, shadow
+	self.chooserOptions = box({ Name = "Options", Position = UDim2.fromScale(0.04, 0.27), Size = UDim2.fromScale(0.92, 0.66), Parent = panel })
+	self.chooser = root
 end
 
 function MatchHud:_buildResult()
-	local root = frame({ Name = "Result", Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Visible = false, ZIndex = 10, Parent = self.gui })
+	local ui = self.ui
+	local root = box({ Name = "Result", Size = UDim2.fromScale(1, 1), Visible = false, ZIndex = 10, Parent = self.gui })
 	self.resultRoot = root
-	frame({ Name = "Dim", Position = UDim2.fromOffset(-200, -120), Size = UDim2.new(1, 400, 1, 240), BackgroundColor3 = INK, BackgroundTransparency = 0.45, Parent = root })
-	local holder = frame({ Name = "Holder", AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(520, 380), BackgroundTransparency = 1, Parent = root })
-	self.scaler:add(holder)
-	local body = UiKit.panel({ Name = "Body", AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromScale(1, 1), Parent = holder }, 16, GOLD)
-	self.resultPop = create("UIScale", { Parent = body })
-	UiKit.slashes(body, UDim2.fromOffset(16, 12), 22, GLOW)
-	UiKit.slashes(body, UDim2.new(1, -64, 0, 12), 22, GLOW)
-	local title, shadow = UiKit.bigText({ Name = "Title", Text = "", TextSize = 42, TextColor3 = WHITE, TextXAlignment = Enum.TextXAlignment.Center, Position = UDim2.fromOffset(20, 18), Size = UDim2.new(1, -40, 0, 50), Parent = body }, 4, Vector2.new(0, 4))
+	frame({ Name = "Dim", Position = UDim2.fromOffset(-200, -200), Size = UDim2.new(1, 400, 1, 400), BackgroundColor3 = INK, BackgroundTransparency = 0.35, Parent = root })
+	local panel = UiKit.panel({ Name = "Panel", AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromScale(0.56, 0.86), Parent = root }, 16, GOLD)
+	self.resultPop = create("UIScale", { Parent = panel })
+	local title, shadow = UiKit.bigText({ Name = "Title", AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.fromScale(0.5, 0.04), Size = UDim2.fromScale(0.9, 0.15), Text = "", TextColor3 = WHITE, TextXAlignment = Enum.TextXAlignment.Center, Parent = panel }, 4, Vector2.new(0, 4), 56)
 	self.resultTitle, self.resultShadow = title, shadow
-	self.resultScore = text({ Name = "Score", Position = UDim2.fromOffset(20, 74), Size = UDim2.new(1, -40, 0, 26), Text = "", TextSize = 20, TextXAlignment = Enum.TextXAlignment.Center, TextTruncate = Enum.TextTruncate.AtEnd, Parent = body })
+	self.resultScore = label({ AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.fromScale(0.5, 0.2), Size = UDim2.fromScale(0.9, 0.08), Text = "", TextXAlignment = Enum.TextXAlignment.Center, Parent = panel }, 26, 10)
 	outline(self.resultScore, 2)
-
 	self.statValues = {}
 	for i, key in { "Goals", "Assists", "Rating" } do
-		local box = frame({ Name = key, Position = UDim2.fromOffset(28 + (i - 1) * 158, 116), Size = UDim2.fromOffset(148, 92), BackgroundColor3 = NAVY, Parent = body })
-		corner(box, 10)
-		stroke(box, if key == "Rating" then GOLD else VIOLET, 2)
-		local value = text({ Name = "Value", Position = UDim2.fromOffset(0, 8), Size = UDim2.new(1, 0, 0, 48), Text = "0", TextSize = 40, TextColor3 = if key == "Rating" then GOLD else CREAM, TextXAlignment = Enum.TextXAlignment.Center, Parent = box })
+		local cell = card({ Name = key, Position = UDim2.fromScale(0.05 + (i - 1) * 0.31, 0.32), Size = UDim2.fromScale(0.28, 0.27) }, 12, if key == "Rating" then GOLD else VIOLET)
+		cell.Parent = panel
+		local value = label({ AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.fromScale(0.5, 0.08), Size = UDim2.fromScale(0.9, 0.56), Text = "0", TextColor3 = if key == "Rating" then GOLD else CREAM, TextXAlignment = Enum.TextXAlignment.Center, Parent = cell }, 48, 14)
 		outline(value, 2.5)
-		local label = text({ Name = "Label", Position = UDim2.fromOffset(0, 62), Size = UDim2.new(1, 0, 0, 20), Text = self.ui[key], TextSize = 13, FontFace = FONT_BOLD, TextColor3 = LILAC, TextXAlignment = Enum.TextXAlignment.Center, Parent = box })
-		outline(label, 1)
+		label({ AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.fromScale(0.5, 0.68), Size = UDim2.fromScale(0.9, 0.22), Text = ui[key], FontFace = FONT_BOLD, TextColor3 = LILAC, TextXAlignment = Enum.TextXAlignment.Center, Parent = cell }, 16, 7)
 		self.statValues[key] = value
 	end
-	self.resultDetail = text({ Name = "Detail", Position = UDim2.fromOffset(20, 220), Size = UDim2.new(1, -40, 0, 20), Text = "", TextSize = 14, FontFace = FONT_MEDIUM, TextXAlignment = Enum.TextXAlignment.Center, Parent = body })
-	outline(self.resultDetail, 1)
-
-	local chips = frame({ Name = "Chips", AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 252), Size = UDim2.fromOffset(460, 30), BackgroundTransparency = 1, Parent = body })
-	create("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, HorizontalAlignment = Enum.HorizontalAlignment.Center, Padding = UDim.new(0, 10), SortOrder = Enum.SortOrder.LayoutOrder, Parent = chips })
-	local _, xp = UiKit.chip(chips, { LayoutOrder = 1, Size = UDim2.fromOffset(0, 30) }, "", LIME)
-	local _, level = UiKit.chip(chips, { LayoutOrder = 2, Size = UDim2.fromOffset(0, 30) }, "", GOLD)
-	self.resultXp, self.resultLevel = xp, level
-
-	self.resultButton = UiKit.button(body, { Name = "Continue", AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 306), Size = UDim2.fromOffset(300, 52) }, self.ui.Continue, function()
+	self.resultDetail = label({ AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.fromScale(0.5, 0.62), Size = UDim2.fromScale(0.9, 0.06), Text = "", FontFace = FONT_MEDIUM, TextXAlignment = Enum.TextXAlignment.Center, Parent = panel }, 18, 8)
+	local chips = box({ Name = "Chips", AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.fromScale(0.5, 0.7), Size = UDim2.fromScale(0.9, 0.08), Parent = panel })
+	create("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, HorizontalAlignment = Enum.HorizontalAlignment.Center, Padding = UDim.new(0.03, 0), Parent = chips })
+	local function chip(color: Color3): TextLabel
+		local c = frame({ Size = UDim2.fromScale(0.3, 1), BackgroundColor3 = NAVY, Parent = chips })
+		corner(c, 8)
+		stroke(c, color, 2)
+		local l = label({ AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromScale(0.9, 0.7), Text = "", TextXAlignment = Enum.TextXAlignment.Center, Parent = c }, 20, 8)
+		outline(l, 1.5)
+		return l
+	end
+	self.resultXp, self.resultLevel = chip(LIME), chip(GOLD)
+	local continue, face = button(panel, { Name = "Continue", AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.fromScale(0.5, 0.95), Size = UDim2.fromScale(0.6, 0.13) }, "gold", function()
 		self:hide()
 		if self.onFinished then
 			self.onFinished()
 		end
-	end, "primary")
+	end)
+	local cl = label({ AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromScale(0.9, 0.62), Text = ui.Continue, TextColor3 = INK, TextXAlignment = Enum.TextXAlignment.Center, Parent = face }, 30, 10)
+	outline(cl, 1.5, rgb(255, 226, 120))
+	self.continueButton = continue
 end
 
 ---------------------------------------------------------------- scoreboard, feed, tactics
 
-function MatchHud:_setClub(index: number, club)
-	local side = self.sides[index]
+local function setBoardClub(refs, index: number, club)
+	local side = refs.sides[index]
+	local from, to = teamColors(club.shirt)
+	side.grad.Color = ColorSequence.new(from, to)
 	for _, child in side.crest:GetChildren() do
-		child:Destroy()
+		if child:IsA("GuiObject") then
+			child:Destroy()
+		end
 	end
-	UiKit.crest(side.crest, { Size = UDim2.fromOffset(44, 44) }, club)
-	side.name.Text = club.name
+	local badge = UiKit.crest(side.crest, { Size = UDim2.fromScale(1, 1) }, club)
+	-- UiKit sizes the letters from an offset size; this badge is sized by scale.
+	local letters = badge:FindFirstChild("Letters") :: TextLabel?
+	if letters then
+		letters.TextScaled = true
+		letters.Size = UDim2.fromScale(0.7, 0.5)
+		letters.AnchorPoint = Vector2.new(0.5, 0.5)
+		letters.Position = UDim2.fromScale(0.5, 0.5)
+		create("UITextSizeConstraint", { MaxTextSize = 24, MinTextSize = 6, Parent = letters })
+	end
+	side.name.Text = string.upper(club.name)
 end
 
 function MatchHud:setScore(score: { home: number, away: number }, pop: boolean?)
-	local value = string.format("%d : %d", score.home, score.away)
-	local changed = self.scoreText.Text ~= value
+	local changed = not self.score or self.score.home ~= score.home or self.score.away ~= score.away
 	self.score = score
-	self.scoreText.Text = value
-	self.scoreShadow.Text = value
-	if changed and pop then
-		UiKit.pop(self.scorePop, 1.5)
+	for _, refs in { self.board, self.miniBoard } do
+		refs.goals1.Text = tostring(score.home)
+		refs.goals2.Text = tostring(score.away)
+		if changed and pop then
+			UiKit.pop(refs.pop, 1.25)
+		end
 	end
 end
 
 function MatchHud:_setMinute(minute: number)
 	self.minute = minute
-	self.minuteText.Text = string.format("%d'", minute)
+	for _, refs in { self.board, self.miniBoard } do
+		refs.minute.Text = string.format("%d'", minute)
+	end
 	self.timeFill.Size = UDim2.fromScale(math.clamp(minute / 90, 0, 1), 1)
 end
 
 function MatchHud:_goalMark(minute: number, ours: boolean)
-	local dot = frame({ Name = "Goal", AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(math.clamp(minute / 90, 0, 1), 0.5), Size = UDim2.fromOffset(14, 14), BackgroundColor3 = if ours then GOLD else RED, ZIndex = 5, Parent = self.timeline })
-	dot.Name = "GoalMark"
-	corner(dot, 999)
+	local dot = frame({ Name = "GoalMark", AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(math.clamp(minute / 90, 0, 1), 0.5), Size = UDim2.fromScale(2, 2), BackgroundColor3 = if ours then GOLD else RED, ZIndex = 5, Parent = self.timeline })
+	create("UIAspectRatioConstraint", { AspectRatio = 1, DominantAxis = Enum.DominantAxis.Height, Parent = dot })
+	corner(dot)
 	stroke(dot, INK, 2)
 end
 
-function MatchHud:_refreshFeed(typeIn: boolean)
-	local count = #self.lines
-	local newest = self.lines[count]
-	self.currentMinute.Text = if newest then string.format("%d'", newest.minute) else ""
-	self.currentText.Text = if newest then newest.text else ""
-	self.currentText.TextColor3 = if newest and newest.goal then GOLD else WHITE
-	if typeIn and newest then
-		self.currentText.MaxVisibleGraphemes = 0
-		local length = utf8.len(newest.text) or #newest.text
-		TweenService:Create(self.currentText, TweenInfo.new(TYPE_TIME, Enum.EasingStyle.Linear), { MaxVisibleGraphemes = length }):Play()
-		UiKit.pop(self.currentPop, if newest.goal then 1.12 else 1.03)
-	else
-		self.currentText.MaxVisibleGraphemes = -1
+local function styleFor(self, kind: string)
+	if kind == "US" or kind == "THEM" then
+		local club = if kind == "US" then self.home else self.away
+		local from, to = teamColors(if club then club.shirt else VIOLET)
+		return { from = from, to = to, text = WHITE }
 	end
-	for i = 1, HISTORY_LINES do
-		local line = self.lines[count - HISTORY_LINES - 1 + i]
-		local slot = self.history[i]
-		slot.label.Text = if line then line.text else ""
-		slot.minute.Text = if line then string.format("%d'", line.minute) else ""
-		slot.label.TextColor3 = if line and line.goal then GOLD else CREAM
-		local fade = 0.15 + 0.6 * (HISTORY_LINES - i) / HISTORY_LINES
-		slot.label.TextTransparency = fade
-		slot.minute.TextTransparency = fade
-	end
+	return KIND_STYLE[kind] or KIND_STYLE.NEUTRAL
 end
 
--- Adds a commentary line (and speaks it if a voice file is set for the key). Returns the text.
-function MatchHud:say(key: string, params: { [string]: any }?, minute: number?): string
+-- Fills the next slot of the board (a new board for each chance, or when it is full).
+function MatchHud:_addLine(line)
+	if line.chance or #self.chapter >= FEED_SLOTS then
+		self.chapter = {}
+		for _, slot in self.slots do
+			slot.bar.Visible = false
+		end
+	end
+	table.insert(self.chapter, line)
+	local slot = self.slots[#self.chapter]
+	local style = styleFor(self, line.kind)
+	slot.grad.Color = ColorSequence.new(style.from, style.to)
+	slot.text.Text = line.text
+	slot.text.TextColor3 = style.text
+	slot.textStroke.Color = if style.text == INK then rgb(255, 236, 160) else INK
+	slot.textStroke.Transparency = if style.text == INK then 0.4 else 0
+	local stamp = line.chance or line.kind == "GOAL" or line.kind == "CONCEDE"
+	slot.watch.Visible = stamp
+	slot.watchText.Text = string.format("%d'", line.minute)
+	slot.text.Position = UDim2.fromScale(if stamp then 0.55 else 0.5, 0.5)
+	slot.text.Size = UDim2.fromScale(if stamp then 0.78 else 0.9, 0.66)
+	slot.stroke.Color = if line.kind == "GOAL" then rgb(255, 250, 200) else INK
+	slot.bar.Visible = true
+	-- Slides in from the right.
+	slot.bar.Position = UDim2.fromScale(0.06, 0)
+	TweenService:Create(slot.bar, TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { Position = UDim2.fromScale(0, 0) }):Play()
+	UiKit.pop(slot.pop, if line.kind == "GOAL" then 1.12 else 0.94)
+end
+
+-- Adds a commentary line (and speaks it if a voice file is set). Returns the text.
+function MatchHud:say(key: string, params: { [string]: any }?, minute: number?, chance: boolean?): string
 	local filled = table.clone(self.names)
 	for name, value in pairs(params or {}) do
 		filled[name] = value
@@ -374,9 +659,9 @@ function MatchHud:say(key: string, params: { [string]: any }?, minute: number?):
 	if line == "" then
 		return ""
 	end
-	table.insert(self.lines, { minute = minute or self.minute, text = line, goal = GOAL_KEYS[key] == true })
-	self:_refreshFeed(true)
-	if GOAL_KEYS[key] then
+	local kind = Commentary.kind(key)
+	self:_addLine({ minute = minute or self.minute, text = line, kind = kind, chance = chance == true })
+	if key == "OPP_GOAL" or key == "TEAM_GOAL" or key == "YOU_GOAL" or key == "ASSIST_GOAL" or key == "HEADER_GOAL" then
 		self:_goalMark(minute or self.minute, key ~= "OPP_GOAL")
 	end
 	local voice = Commentary.voice(key)
@@ -390,13 +675,80 @@ function MatchHud:say(key: string, params: { [string]: any }?, minute: number?):
 	return line
 end
 
+function MatchHud:_toggleSpeed()
+	self.speed = if self.speed == 1 then 2 else 1
+	self.speedLabel.Text = if self.speed == 1 then "»  ×1" else "»»  ×2"
+end
+
+local function hearts(n: number): string
+	return string.rep("❤", n) .. string.rep("♡", 3 - n)
+end
+
 function MatchHud:_showTactics()
-	for n, entry in self.effortButtons do
-		entry.ring.Visible = n == self.effort
+	local ui = self.ui
+	self.workCard.value.Text = hearts(self.effort) .. "  " .. ui.EffortNames[self.effort]
+	self.focusCard.glyph.Text = if self.focus == "ATTACK" then "⚔" else "🛡"
+	self.focusCard.value.Text = if self.focus == "ATTACK" then ui.Attack else ui.Defense
+end
+
+function MatchHud:_closeChooser()
+	self.chooser.Visible = false
+end
+
+-- Work rate (1-3 hearts) or focus (attack / defense): big option cards, like the reference.
+function MatchHud:_openChooser(which: string)
+	local ui = self.ui
+	for _, child in self.chooserOptions:GetChildren() do
+		child:Destroy()
 	end
-	for focus, entry in self.focusButtons do
-		entry.ring.Visible = focus == self.focus
+	local title = if which == "WORK" then ui.Work else ui.Focus
+	self.chooserTitle.Text = title
+	self.chooserShadow.Text = title
+	local options = {}
+	if which == "WORK" then
+		for n = 1, 3 do
+			table.insert(options, { glyph = string.rep("❤", n), name = ui.EffortNames[n], info = ui.EffortInfo[n], picked = n == self.effort, choose = function()
+				self:_pickEffort(n)
+			end, disabled = n > 1 and self.stamina <= 0 })
+		end
+	else
+		for _, focus in { "ATTACK", "DEFENSE" } do
+			table.insert(options, {
+				glyph = if focus == "ATTACK" then "⚔" else "🛡",
+				name = if focus == "ATTACK" then ui.Attack else ui.Defense,
+				info = if focus == "ATTACK" then ui.AttackInfo else ui.DefenseInfo,
+				picked = focus == self.focus,
+				choose = function()
+					self:_pickFocus(focus)
+				end,
+			})
+		end
 	end
+	local count = #options
+	local width = (1 - 0.03 * (count - 1)) / count
+	for i, option in options do
+		local b, face = button(self.chooserOptions, { Name = "Option" .. i, Position = UDim2.fromScale((i - 1) * (width + 0.03), 0), Size = UDim2.fromScale(width, 1) }, if option.picked then "gold" else "violet", function()
+			if option.disabled then
+				return
+			end
+			option.choose()
+			self:_closeChooser()
+		end)
+		local ink = if option.picked then INK else WHITE
+		local glyph = label({ AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.fromScale(0.5, 0.06), Size = UDim2.fromScale(0.9, 0.3), Text = option.glyph, TextColor3 = if option.picked then RED else rgb(255, 92, 120), TextXAlignment = Enum.TextXAlignment.Center, Parent = face }, 54, 14)
+		outline(glyph, 2)
+		local name = label({ AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.fromScale(0.5, 0.4), Size = UDim2.fromScale(0.9, 0.17), Text = option.name, TextColor3 = ink, TextXAlignment = Enum.TextXAlignment.Center, Parent = face }, 28, 10)
+		if not option.picked then
+			outline(name, 2)
+		end
+		label({ AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.fromScale(0.5, 0.62), Size = UDim2.fromScale(0.86, 0.3), Text = option.info, FontFace = FONT_BOLD, TextWrapped = true, TextColor3 = if option.picked then INK else LILAC, TextXAlignment = Enum.TextXAlignment.Center, Parent = face }, 18, 8)
+		if option.disabled then
+			b.Active = false
+			face.BackgroundTransparency = 0.5
+		end
+	end
+	self.chooser.Visible = true
+	UiKit.pop(self.chooserPop, 0.85)
 end
 
 function MatchHud:_pickEffort(n: number)
@@ -407,6 +759,7 @@ function MatchHud:_pickEffort(n: number)
 	self.tacticAt = os.clock()
 	self:_showTactics()
 	self:say("TACTIC_EFFORT_" .. n)
+	UiKit.pop(self.heartPop, 1.4)
 	if self.onEffort then
 		self.onEffort(n)
 	end
@@ -425,11 +778,7 @@ function MatchHud:_pickFocus(focus: string)
 	end
 end
 
-local function staminaColor(stamina: number): Color3
-	return if stamina > 50 then LIME elseif stamina > 20 then GOLD else RED
-end
-
--- Server state: { stamina, effort, focus }.
+-- Server state: { stamina, effort, focus, goals, assists, shots, passes, goodPasses }.
 function MatchHud:setState(state)
 	if typeof(state) ~= "table" then
 		return
@@ -437,14 +786,23 @@ function MatchHud:setState(state)
 	local stamina = math.clamp(tonumber(state.stamina) or self.stamina, 0, 100)
 	local wasEmpty = self.stamina <= 0
 	self.stamina = stamina
-	for _, pair in { { self.staminaFill, self.staminaLabel }, { self.playStaminaFill, self.playStaminaLabel } } do
-		TweenService:Create(pair[1], TweenInfo.new(0.4), { Size = UDim2.fromScale(math.max(stamina, 0.001) / 100, 1), BackgroundColor3 = staminaColor(stamina) }):Play()
-		pair[2].Text = string.format("⚡ %d%%", math.floor(stamina + 0.5))
-	end
+	TweenService:Create(self.energyFill, TweenInfo.new(0.4), { Size = UDim2.fromScale(math.max(stamina, 0.001) / 100, 1) }):Play()
+	self.energyGradient.Color = if stamina > 50 then ColorSequence.new(rgb(150, 255, 110), rgb(50, 190, 60))
+		elseif stamina > 20 then ColorSequence.new(rgb(255, 226, 120), ORANGE)
+		else ColorSequence.new(rgb(255, 120, 140), RED)
+	self.energyText.Text = string.format("%d%%", math.floor(stamina + 0.5))
 	if os.clock() - self.tacticAt > TACTIC_HOLD then
 		self.effort = state.effort or self.effort
 		self.focus = state.focus or self.focus
 		self:_showTactics()
+	end
+	if state.goals then
+		self.statText.Goals.Text = tostring(state.goals)
+		self.statText.Assists.Text = tostring(state.assists or 0)
+		self.statText.Shots.Text = tostring(state.shots or 0)
+	end
+	if state.rating then
+		self.ratingText.Text = string.format("%s  %.1f", self.ui.Rating, state.rating)
 	end
 	-- Out of stamina: full effort is over, drop to one heart.
 	if stamina <= 0 and not wasEmpty then
@@ -460,32 +818,65 @@ function MatchHud:setState(state)
 	end
 end
 
+-- One chip per moment in the summary: GOAL, ASSIST or NONE.
+function MatchHud:addMomentChip(outcome: string)
+	local i = #self.momentChips + 1
+	local chip = frame({ Name = "Moment" .. i, LayoutOrder = i, Size = UDim2.fromScale(0.13, 0.9), BackgroundColor3 = if outcome == "GOAL" then GOLD elseif outcome == "ASSIST" then LIME else rgb(70, 50, 120), Parent = self.chipHolder })
+	create("UIAspectRatioConstraint", { AspectRatio = 1, DominantAxis = Enum.DominantAxis.Height, Parent = chip })
+	corner(chip)
+	stroke(chip, INK, 2)
+	label({ Size = UDim2.fromScale(1, 1), Text = if outcome == "GOAL" then "⚽" elseif outcome == "ASSIST" then "A" else "•", TextColor3 = INK, TextXAlignment = Enum.TextXAlignment.Center, Parent = chip }, 20, 7)
+	table.insert(self.momentChips, chip)
+end
+
 ---------------------------------------------------------------- match flow
 
 -- clubs resolved by the caller; state: the server's opening { stamina, effort, focus }.
 function MatchHud:start(home, away, surname: string, number: number?, state)
 	self.token += 1
+	self.home, self.away = home, away
 	self.names = { home = home.name, away = away.name, me = surname }
-	self.lines = {}
-	self:_setClub(1, home)
-	self:_setClub(2, away)
+	self.chapter = {}
+	for _, slot in self.slots do
+		slot.bar.Visible = false
+	end
+	for _, chip in self.momentChips do
+		chip:Destroy()
+	end
+	self.momentChips = {}
 	for _, child in self.timeline:GetChildren() do
 		if child.Name == "GoalMark" then
 			child:Destroy()
 		end
 	end
-	self.playerName.Text = if number then string.format("#%d  %s", number, string.upper(surname)) else string.upper(surname)
+	for _, refs in { self.board, self.miniBoard } do
+		setBoardClub(refs, 1, home)
+		setBoardClub(refs, 2, away)
+	end
+	local from, to = teamColors(home.shirt)
+	self.shirtGradient.Color = ColorSequence.new(from, to)
+	self.shirtNumber.Text = tostring(number or "")
+	self.playerName.Text = string.upper(surname)
+	self.ratingText.Text = self.ui.Rating .. "  6.0"
+	for _, value in self.statText do
+		value.Text = "0"
+	end
 	self.stamina = 100
 	self.tacticAt = -math.huge
+	self.score = nil
 	self:setState(state or { stamina = 100, effort = 2, focus = "ATTACK" })
 	self:setScore({ home = 0, away = 0 })
 	self:_setMinute(0)
-	self:_refreshFeed(false)
-	self:setHighBall(false)
-	self.momentHolder.Visible = false
+	self:setStatus(self.names.home .. "  —  " .. self.names.away)
+	self.playButton.Visible = false
+	self.chooser.Visible = false
 	self.resultRoot.Visible = false
-	self:setPlaying(false, true)
+	self:setMode("STUDIO", true)
 	self.gui.Enabled = true
+end
+
+function MatchHud:setStatus(value: string)
+	self.statusText.Text = value
 end
 
 -- Plays the simulated events one line at a time (minute ticking up to each), then calls done.
@@ -495,9 +886,9 @@ function MatchHud:playEvents(events: { any }, done: () -> ())
 	task.spawn(function()
 		for _, event in events do
 			local from = self.minute
-			local steps = math.clamp(event.minute - from, 0, 12)
+			local steps = math.clamp(event.minute - from, 0, 10)
 			for step = 1, steps do
-				task.wait(0.05)
+				task.wait(0.04 / self.speed)
 				if token ~= self.token then
 					return
 				end
@@ -509,9 +900,13 @@ function MatchHud:playEvents(events: { any }, done: () -> ())
 				local score = event.score
 				key = if score.home > score.away then "FULLTIME_WIN" elseif score.home == score.away then "FULLTIME_DRAW" else "FULLTIME_LOSS"
 			end
-			self:setScore(event.score, true)
-			self:say(key, { n = event.number }, event.minute)
-			task.wait(if GOAL_KEYS[key] then LINE_TIME + 0.6 else LINE_TIME)
+			if event.score then
+				self:setScore(event.score, true)
+			end
+			self:say(key, { n = event.number }, event.minute, event.chance)
+			local kind = Commentary.kind(key)
+			local wait = if kind == "GOAL" or kind == "CONCEDE" then GOAL_LINE_TIME elseif event.chance or key == "BUILD_ONBALL" or key == "BUILD_RECEIVE" or key == "PROMPT" then CHANCE_LINE_TIME else LINE_TIME
+			task.wait(wait / self.speed)
 			if token ~= self.token then
 				return
 			end
@@ -520,76 +915,143 @@ function MatchHud:playEvents(events: { any }, done: () -> ())
 	end)
 end
 
--- Your moment: the banner over the studio, then go() switches to the pitch.
-function MatchHud:showMoment(moment: { kind: string, minute: number, index: number, number: number }, go: () -> ())
+-- Your moment: the PLAY button under the feed (presses itself after a while).
+function MatchHud:showPlay(onPlay: () -> ())
 	self.token += 1
 	local token = self.token
-	self:_setMinute(moment.minute)
-	local key = if moment.kind == "RECEIVE" then "MOMENT_RECEIVE" else "MOMENT_ONBALL"
-	local line = self:say(key, { n = moment.number }, moment.minute)
-	self.momentCount.Text = string.format(self.ui.Moment, moment.index)
-	self.momentText.Text = line
-	self.momentHolder.Visible = true
-	UiKit.pop(self.momentPop, 0.6)
-	task.delay(MOMENT_BANNER_TIME, function()
-		if token == self.token then
-			self.momentHolder.Visible = false
-			go()
+	self.onPlay = onPlay
+	self.playButton.Visible = true
+	self.statusBar.Visible = false
+	UiKit.pop(self.playPop, 0.6)
+	task.spawn(function()
+		local started = os.clock()
+		while token == self.token and self.playButton.Visible do
+			local t = os.clock() - started
+			self.playPop.Scale = 1 + 0.05 * math.sin(t * 6)
+			if t > AUTO_PLAY then
+				self:_pressPlay()
+				return
+			end
+			task.wait(1 / 30)
 		end
 	end)
 end
 
--- playing: the pitch is on screen (your moment); otherwise the studio covers it.
-function MatchHud:setPlaying(playing: boolean, instant: boolean?)
-	self.playing = playing
-	self.studio.Visible = not playing
-	self.playHolder.Visible = playing
-	self.highHolder.Visible = playing
-	if playing then
-		self.momentHolder.Visible = false
-		self:setPressure(nil)
+function MatchHud:_pressPlay()
+	if not self.playButton.Visible then
+		return
 	end
-	local goal = if playing then 1 else 0
+	self.playButton.Visible = false
+	self.statusBar.Visible = true
+	local onPlay = self.onPlay
+	self.onPlay = nil
+	if onPlay then
+		onPlay()
+	end
+end
+
+-- STUDIO (the commentator's screen) or PLAY (your moment on the pitch).
+function MatchHud:setMode(mode: string, instant: boolean?)
+	local studio = mode == "STUDIO"
+	self.mode = mode
+	self.studio.Visible = studio
+	self.play.Visible = not studio
+	self.pointerGui.Enabled = not studio
+	if not studio then
+		self.chooser.Visible = false
+		self.banner.Visible = false
+		self.bannerShadow.Visible = false
+		self:setTimer(nil)
+		self:setHint(nil)
+		self:hideStrike()
+	end
+	local goal = if studio then 0.18 else 1
 	if instant then
-		self.backdrop.GroupTransparency = goal
-		self.backdrop.Visible = not playing
+		self.backdrop.BackgroundTransparency = goal
+		self.backdrop.Visible = studio
 		return
 	end
 	self.backdrop.Visible = true
-	local tween = TweenService:Create(self.backdrop, TweenInfo.new(FADE_TIME, Enum.EasingStyle.Quad), { GroupTransparency = goal })
+	local tween = TweenService:Create(self.backdrop, TweenInfo.new(FADE_TIME, Enum.EasingStyle.Quad), { BackgroundTransparency = goal })
 	tween.Completed:Once(function()
-		if self.playing == playing then
-			self.backdrop.Visible = not playing
+		if self.mode == mode then
+			self.backdrop.Visible = studio
 		end
 	end)
 	tween:Play()
 end
 
--- Time left before the tackle, 1 = plenty, 0 = now; nil hides the bar.
-function MatchHud:setPressure(left: number?)
-	self.pressureTrack.Visible = left ~= nil
-	self.pressureLabel.Visible = left ~= nil
+-- Time left before the tackle, 1 = plenty, 0 = now; nil hides it.
+function MatchHud:setTimer(left: number?)
+	self.timer.Visible = left ~= nil
 	if left then
 		local k = math.clamp(left, 0, 1)
-		self.pressureFill.Size = UDim2.fromScale(k, 1)
-		self.pressureFill.BackgroundColor3 = if k > 0.5 then ORANGE else RED
-		self.pressureLabel.TextTransparency = if k < 0.3 then 0.5 + 0.5 * math.sin(os.clock() * 18) else 0
+		self.timerFill.Size = UDim2.fromScale(math.max(k, 0.001), 1)
+		self.timerGradient.Color = if k > 0.5 then ColorSequence.new(rgb(150, 255, 110), rgb(50, 190, 60))
+			elseif k > 0.25 then ColorSequence.new(rgb(255, 226, 120), ORANGE)
+			else ColorSequence.new(rgb(255, 120, 140), RED)
 	end
 end
 
-function MatchHud:setHighBall(on: boolean)
-	self.highBall = on
-	self.highSelect.ring.Visible = on
+function MatchHud:setHint(value: string?)
+	self.hint.Visible = value ~= nil
+	if value and self.hintText.Text ~= value then
+		self.hintText.Text = value
+	end
 end
 
--- The high-ball switch only makes sense while you can still play the ball.
-function MatchHud:setHighBallVisible(visible: boolean)
-	self.highHolder.Visible = visible and self.playing == true
+function MatchHud:showStrike()
+	self.strike.Visible = true
+	self:setStrikeTimer(1)
+	UiKit.pop(create("UIScale", { Parent = self.strikeTitle }), 0.6)
+end
+
+function MatchHud:setStrikeTimer(left: number)
+	self.strikeFill.Size = UDim2.fromScale(math.clamp(left, 0.001, 1), 1)
+end
+
+-- Reticle at a pointer position (input coordinates), nil hides it.
+function MatchHud:setReticle(position: Vector2?)
+	self.reticle.Visible = position ~= nil
+	if position then
+		self.reticle.Position = UDim2.fromOffset(position.X, position.Y)
+	end
+end
+
+function MatchHud:hideStrike()
+	self.strike.Visible = false
+	self.reticle.Visible = false
+end
+
+-- Big word over the pitch: GOAL, SAVE, BLOCKED, ONETWO ... (keys of ui.Banner).
+function MatchHud:banner(kind: string, duration: number?)
+	local value = self.ui.Banner[kind]
+	if not value then
+		return
+	end
+	local good = kind == "GOAL" or kind == "ONETWO" or kind == "PASS" or kind == "CROSS"
+	self.banner.Text = value
+	self.bannerShadow.Text = value
+	self.banner.TextColor3 = if kind == "GOAL" then GOLD elseif good then LIME else rgb(255, 120, 140)
+	self.banner.Visible = true
+	self.bannerShadow.Visible = true
+	UiKit.pop(self.bannerPop, 0.4)
+	UiKit.pop(self.bannerShadowPop, 0.4)
+	self.bannerToken = (self.bannerToken or 0) + 1
+	local token = self.bannerToken
+	task.delay(duration or 1.3, function()
+		if self.bannerToken == token then
+			self.banner.Visible = false
+			self.bannerShadow.Visible = false
+		end
+	end)
 end
 
 function MatchHud:showResult(result, career)
 	self.token += 1
 	local ui = self.ui
+	self:setMode("STUDIO", true)
+	self.playButton.Visible = false
 	local title = if result.outcome == "WIN" then ui.Win elseif result.outcome == "DRAW" then ui.Draw else ui.Loss
 	self.resultTitle.Text = title
 	self.resultShadow.Text = title
@@ -598,22 +1060,21 @@ function MatchHud:showResult(result, career)
 	self.statValues.Goals.Text = tostring(result.goals)
 	self.statValues.Assists.Text = tostring(result.assists)
 	self.statValues.Rating.Text = string.format("%.1f", result.rating)
-	self.resultDetail.Text = string.format(ui.Shots, result.shots, result.goodPasses, result.passes)
+	self.resultDetail.Text = string.format(ui.ShotsLine, result.shots, result.goodPasses, result.passes)
 	self.resultXp.Text = string.format(ui.Xp, result.xp)
 	self.resultLevel.Text = string.format(ui.Level, if career then career.level else 1)
-	self.momentHolder.Visible = false
 	self.resultRoot.Visible = true
 	UiKit.pop(self.resultPop, 0.6)
-	self.resultButton:playShine()
 end
 
 function MatchHud:hide()
 	self.token += 1
 	self.gui.Enabled = false
+	self.pointerGui.Enabled = false
 end
 
-function MatchHud:setUiBoost(boost: number)
-	self.scaler:setBoost(boost)
+function MatchHud:setUiBoost(_boost: number)
+	-- Laid out in screen fractions: nothing to scale.
 end
 
 return MatchHud
