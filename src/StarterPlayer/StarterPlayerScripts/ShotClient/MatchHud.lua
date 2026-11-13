@@ -299,6 +299,14 @@ function MatchHud:_buildPlayerCard(column: Frame)
 	corner(rating, 8)
 	stroke(rating, GOLD, 2)
 	self.ratingText = label({ AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromScale(0.92, 0.72), Text = ui.Rating .. "  6.0", TextColor3 = GOLD, TextXAlignment = Enum.TextXAlignment.Center, Parent = rating }, 20, 8)
+	self.ratingBox = rating
+	self.ratingStroke = rating:FindFirstChildOfClass("UIStroke")
+	self.ratingPop = create("UIScale", { Parent = rating })
+	-- The last change (+0.9 / -0.2) pops beside the rating.
+	self.ratingDelta = label({ Name = "Delta", AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, 6, 0, 0), Size = UDim2.fromScale(0.4, 0.9), Text = "", TextColor3 = LIME, TextXAlignment = Enum.TextXAlignment.Center, Visible = false, ZIndex = 5, Parent = rating }, 22, 9)
+	outline(self.ratingDelta, 2)
+	self.ratingDeltaPop = create("UIScale", { Parent = self.ratingDelta })
+	self.ratingValue = 6
 	self.statText = {}
 	for i, key in { "Goals", "Assists", "Shots" } do
 		local cell = box({ Name = key, Position = UDim2.fromScale(0.08 + (i - 1) * 0.28, 0.84), Size = UDim2.fromScale(0.28, 0.14), Parent = panel })
@@ -804,7 +812,7 @@ function MatchHud:setState(state)
 		self.statText.Shots.Text = tostring(state.shots or 0)
 	end
 	if state.rating then
-		self.ratingText.Text = string.format("%s  %.1f", self.ui.Rating, state.rating)
+		self:_setRating(tonumber(state.rating) or self.ratingValue)
 	end
 	-- Out of stamina: full effort is over, drop to one heart.
 	if stamina <= 0 and not wasEmpty then
@@ -818,6 +826,59 @@ function MatchHud:setState(state)
 			end
 		end
 	end
+end
+
+-- The match rating moves with what you do. During a moment the card is off screen, so the change
+-- waits and plays when the studio comes back.
+function MatchHud:_setRating(value: number)
+	if math.abs(value - self.ratingValue) < 0.05 then
+		return
+	end
+	self.ratingPending = value
+	if self.mode == "STUDIO" then
+		self:_showRatingChange()
+	end
+end
+
+function MatchHud:_showRatingChange()
+	local value = self.ratingPending
+	if not value then
+		return
+	end
+	self.ratingPending = nil
+	local from = self.ratingValue
+	local delta = value - from
+	self.ratingValue = value
+	local up = delta > 0
+	local color = if up then LIME else rgb(255, 110, 130)
+	self.ratingDelta.Text = string.format("%s%.1f", if up then "+" else "−", math.abs(delta))
+	self.ratingDelta.TextColor3 = color
+	self.ratingDelta.Visible = true
+	UiKit.pop(self.ratingDeltaPop, 0.4)
+	UiKit.pop(self.ratingPop, if up then 1.18 else 0.88)
+	if self.ratingStroke then
+		self.ratingStroke.Color = color
+	end
+	-- Count from the old value to the new one.
+	local token = (self.ratingToken or 0) + 1
+	self.ratingToken = token
+	task.spawn(function()
+		local steps = 12
+		for i = 1, steps do
+			if self.ratingToken ~= token then
+				return
+			end
+			self.ratingText.Text = string.format("%s  %.1f", self.ui.Rating, from + delta * i / steps)
+			task.wait(0.035)
+		end
+		task.wait(2.6)
+		if self.ratingToken == token then
+			self.ratingDelta.Visible = false
+			if self.ratingStroke then
+				self.ratingStroke.Color = GOLD
+			end
+		end
+	end)
 end
 
 -- One chip per moment in the summary: GOAL, ASSIST or NONE.
@@ -860,6 +921,9 @@ function MatchHud:start(home, away, surname: string, number: number?, state)
 	self.shirtNumber.Text = tostring(number or "")
 	self.playerName.Text = string.upper(surname)
 	self.ratingText.Text = self.ui.Rating .. "  6.0"
+	self.ratingValue = 6
+	self.ratingPending = nil
+	self.ratingDelta.Visible = false
 	for _, value in self.statText do
 		value.Text = "0"
 	end
@@ -968,6 +1032,13 @@ function MatchHud:setMode(mode: string, instant: boolean?)
 		self:hideStrike()
 	end
 	local goal = if studio then 0.18 else 1
+	if studio and self.ratingPending then
+		task.delay(FADE_TIME + 0.2, function()
+			if self.mode == "STUDIO" then
+				self:_showRatingChange()
+			end
+		end)
+	end
 	if instant then
 		self.backdrop.BackgroundTransparency = goal
 		self.backdrop.Visible = studio
