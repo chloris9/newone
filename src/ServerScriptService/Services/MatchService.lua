@@ -141,6 +141,15 @@ local function score(match: Match)
 	return { home = match.homeGoals, away = match.awayGoals }
 end
 
+-- Live match rating (shown on the player card as it changes): a goal lifts it a lot, a missed
+-- chance, a misplaced pass or losing the ball costs a little.
+local function rating(match: Match): number
+	local s = match.stats
+	local r = 6 + s.goals * 1.0 + s.assists * 0.7 + s.goodPasses * 0.1 + s.tackles * 0.2
+		- (s.shots - s.goals) * 0.15 - (s.passes - s.goodPasses) * 0.2 - s.lost * 0.25
+	return math.floor(math.clamp(r, 3, 10) * 10 + 0.5) / 10
+end
+
 local function state(match: Match)
 	local s = match.stats
 	return {
@@ -153,15 +162,10 @@ local function state(match: Match)
 		shots = s.shots,
 		passes = s.passes,
 		goodPasses = s.goodPasses,
+		rating = rating(match),
 	}
 end
 
-local function rating(match: Match): number
-	local s = match.stats
-	local r = 6 + s.goals * 1.1 + s.assists * 0.7 + s.goodPasses * 0.12 + s.tackles * 0.15
-		- (s.shots - s.goals) * 0.08 - (s.passes - s.goodPasses) * 0.12 - s.lost * 0.12
-	return math.floor(math.clamp(r, 4, 10) * 10 + 0.5) / 10
-end
 
 local function summary(match: Match)
 	local s = match.stats
