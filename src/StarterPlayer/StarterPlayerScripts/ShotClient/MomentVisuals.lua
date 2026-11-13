@@ -31,6 +31,15 @@ local DECIDE_FOV = 50
 local CAMERA_PITCH = 40 -- degrees below the horizon on the pitch view
 local STRIKE_FOV = 38
 local STRIKE_DISTANCE = 5.4 -- camera behind the ball on the strike screen
+-- Shots in a moment: high behind the shooter, so the goal stays in view over everyone's heads.
+local SHOT_FOV = 50
+local SHOT_BACK = 12
+local SHOT_HEIGHT = 11
+local GOAL_MOUTH = Vector3.new(0, 4, 0)
+-- Players between the camera and the play turn see-through.
+local FADE = 0.7
+local FADE_RADIUS = 3.2
+local FADE_NEAR = 9
 local MATE_TARGET_RADIUS = 6 -- the arrow "points at" a teammate this close to its end
 
 local rgb = Color3.fromRGB
@@ -239,18 +248,41 @@ function MomentVisuals:setPlayer(number: number, surname: string)
 	FigureBuilder.setPrints(self.me.model, number, surname)
 end
 
+local function applyLook(animator)
+	local hidden = animator.hidden
+	local fade = animator.fade or 0
+	for _, part in animator.hideParts do
+		if part:IsA("SurfaceGui") then
+			part.Enabled = not hidden and fade < 0.3
+		else
+			part.LocalTransparencyModifier = if hidden then 1 else fade
+		end
+	end
+end
+
 local function setHidden(animator, hidden: boolean)
 	if animator.hidden == hidden then
 		return
 	end
 	animator.hidden = hidden
-	for _, part in animator.hideParts do
-		if part:IsA("SurfaceGui") then
-			part.Enabled = not hidden
-		else
-			part.LocalTransparencyModifier = if hidden then 1 else 0
-		end
+	applyLook(animator)
+end
+
+local function setFade(animator, fade: number)
+	if math.abs((animator.fade or 0) - fade) < 0.01 then
+		return
 	end
+	animator.fade = fade
+	if not animator.hidden then
+		applyLook(animator)
+	end
+end
+
+-- Distance from p to the segment a-b, and how far along it p lies (0..1).
+local function segmentDistance(p: Vector3, a: Vector3, b: Vector3): (number, number)
+	local ab = b - a
+	local t = math.clamp((p - a):Dot(ab) / math.max(ab:Dot(ab), 1e-6), 0, 1)
+	return (p - (a + ab * t)).Magnitude, t
 end
 
 function MomentVisuals:_setBall(position: Vector3)
@@ -813,8 +845,13 @@ function MomentVisuals:handOffShot(shooter: any, spot: Vector3, header: boolean?
 	self.phase = "SHOT"
 	self.replay = nil
 	self:hideBall()
-	self.cameraMode = "NONE"
 	local figure = if shooter == "ME" then self.me else self.mates[shooter]
+	-- Our own camera from high behind the shooter (ShotVisuals' low shot camera would sit behind
+	-- everyone's backs out here).
+	self.shotSpot = flat(spot)
+	self.shotShooter = figure
+	self.shotClock = 0
+	self:_blendCamera("SHOT", 0.45)
 	if figure and shooter ~= "ME" then
 		local toGoal = unit(flat(-spot), Vector3.new(0, 0, -1))
 		figure:place(if header then flat(spot) - toGoal * 0.4 else standFor(spot, toGoal), toGoal)
@@ -893,8 +930,15 @@ function MomentVisuals:_updateCamera(dt: number)
 		target, fov = self.strikeCamera, STRIKE_FOV
 	elseif mode == "FOCUS" and self.focus then
 		local f = self.focus.model:GetPivot().Position
-		local from = Vector3.new(f.X * 0.85, 6.5, f.Z + 15)
+		local from = Vector3.new(f.X * 0.85, 8.5, f.Z + 15)
 		target, fov = CFrame.lookAt(from, f + Vector3.new(0, 1.2, 0)), 40
+	elseif mode == "SHOT" and self.shotSpot then
+		local spot = self.shotSpot
+		self.shotClock += dt
+		-- A slow push in while the ball flies.
+		local back = SHOT_BACK - 3 * smooth(math.min(self.shotClock / 1.6, 1))
+		local position = spot + unit(spot, Vector3.new(0, 0, 1)) * back + Vector3.new(0, SHOT_HEIGHT, 0)
+		target, fov = CFrame.lookAt(position, GOAL_MOUTH:Lerp(spot, 0.3)), SHOT_FOV
 	elseif self.layout then
 		local position, look = decideCamera(self.layout)
 		if self.lookAt then
@@ -920,8 +964,35 @@ function MomentVisuals:_updateCamera(dt: number)
 	end
 end
 
+-- Whoever stands between the camera and what matters (the goal on a shot, the scorer when he
+-- celebrates) or right in front of the lens fades to see-through; everyone else back to solid.
+function MomentVisuals:_updateFade(dt: number)
+	local mode = self.cameraMode
+	local focus, keep
+	if mode == "SHOT" and self.shotSpot then
+		focus, keep = GOAL_MOUTH, self.shotShooter
+	elseif mode == "FOCUS" and self.focus then
+		focus, keep = self.focus.model:GetPivot().Position + Vector3.new(0, 1.5, 0), self.focus
+	end
+	local eye = workspace.CurrentCamera.CFrame.Position
+	local k = math.min(1, dt * 8)
+	for _, figure in self:_figures() do
+		local want = 0
+		if focus and figure ~= keep then
+			local chest = figure.model:GetPivot().Position + Vector3.new(0, 1.5, 0)
+			local d, t = segmentDistance(chest, eye, focus)
+			if (d < FADE_RADIUS and t > 0.02 and t < 0.97) or (chest - eye).Magnitude < FADE_NEAR then
+				want = FADE
+			end
+		end
+		local now = figure.fade or 0
+		setFade(figure, if math.abs(want - now) < 0.02 then want else now + (want - now) * k)
+	end
+end
+
 function MomentVisuals:update(dt: number)
 	self:_updateCamera(dt)
+	self:_updateFade(dt)
 	if not self.active or not self.layout then
 		return
 	end
