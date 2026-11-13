@@ -1,23 +1,22 @@
--- The match after training: a simulated 90 minutes told by the commentator, with 3-5 moments the
--- player plays himself in 3D. Everything is decided here; the client shows it and sends input.
+-- The match after training: a simulated 90 minutes told by the commentator, with 5-7 moments the
+-- player plays himself. Everything is decided here; the client shows it and sends input.
 --
 -- Flow (MatchRequest: client -> server, MatchUpdate: server -> client):
 --   CareerService "START_MATCH" -> MatchService.start: builds the timeline, returns the header.
 --   "NEXT"   -> MatchUpdate { events, state } for the next slot of the timeline, or
---               { events, state, moment } when it is the player's moment, or { events, result } at
---               full time. What happens in a slot is rolled when it is reached, so the player's
---               effort and focus (below) change the rest of the match.
+--               { events, state, moment } when it is the player's moment (events are then the
+--               chance's build-up lines), or { events, result } at full time. What happens in a
+--               slot is rolled when it is reached, so effort and focus change the rest of the match.
 --   "EFFORT", 1|2|3 / "FOCUS", "ATTACK"|"DEFENSE" -> tactics. Stamina drains every match minute in
 --               proportion to the effort; more effort = more moments and more time in them, low
 --               stamina = less accurate and less time before the tackle.
---   moment   -> a MOMENT episode (MomentPhysics layout) inside the MatchUpdate. The client plays the
---               intro, then sends "READY": the decision clock starts and the presser tackles at
---               layout.tackleTime unless SubmitEpisodeInput (episodeId, a, b, power, clientTime,
---               action) arrives first: action SHOT (aimX, aimY, power), PASS or CROSS (dirX, dirZ,
---               power). Results come back as EpisodeResult.
---   "AUTO"   -> after your good pass or cross: the teammate's shot (a header after a cross),
---               simulated here and sent as an episode that already carries its result
---               (episode.auto). A goal counts as your assist.
+--   moment   -> a MOMENT episode (MomentPhysics layout). The client plays the step's intro, then
+--               sends "READY", step: the decision clock starts and the presser tackles at
+--               layout.tackleTime unless MomentInput arrives first:
+--               (episodeId, step, dirX, dirZ, length, hitX, hitY, aimTime) = the arrow on the
+--               ground and where the ball was struck. The result (EpisodeResult, kind MOMENT) is a
+--               shot, or a pass that is lost, finished by a teammate near goal (result.finish), or
+--               played back to you (result.continue = the next step's layout).
 -- The result is saved once, by CareerService.onMatchFinished, when full time is sent.
 
 local Players = game:GetService("Players")
@@ -26,24 +25,21 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local ShotConfig = require(Shared:WaitForChild("ShotConfig"))
 local PassConfig = require(Shared:WaitForChild("PassConfig"))
-local PassPhysics = require(Shared:WaitForChild("PassPhysics"))
 local CareerConfig = require(Shared:WaitForChild("CareerConfig"))
 local MomentPhysics = require(Shared:WaitForChild("MomentPhysics"))
-local EpisodeService = require(script.Parent.EpisodeService)
 local ShotResolver = require(script.Parent.ShotResolver)
 
 local Moment = MomentPhysics.Config
 
--- Timeline: SLOTS minutes get an event each (~1-2 commentary lines). With the client's line time
--- and 3-5 moments this makes a match of about 1.5-2 minutes.
-local SLOTS = 17
-local MOMENTS_MIN, MOMENTS_MAX = 3, 5
-local MOMENT_CHANCE = 0.21 -- per slot, before effort / focus / stamina
-local MIN_REMOTE_INTERVAL = 0.2
+-- Timeline: SLOTS minutes get an event each. A moment is 2-3 build-up lines, the play and 1-2
+-- result lines; the rest are single lines. About 2-2.5 minutes a match.
+local SLOTS = 15
+local MOMENTS_MIN, MOMENTS_MAX = 5, 7
+local MOMENT_CHANCE = 0.36 -- per slot, before effort / focus / stamina
+local MIN_REMOTE_INTERVAL = 0.15
 local MIN_TACTIC_INTERVAL = 0.15
 local FIRST_EPISODE_ID = 100000 -- kept apart from training episode ids
 local TEAMMATE_NUMBERS = { 7, 28 } -- MomentPhysics teammates 1 and 2
-local PASSER_NUMBER = 28 -- RECEIVE moments: teammate 2 plays the ball to you
 
 -- Stamina (0-100) lost per match minute, by effort: proportional to the effort.
 local STAMINA_PER_MINUTE = 0.36
@@ -51,12 +47,11 @@ local HALFTIME_RECOVERY = 12
 local EFFORT_MOMENTS = { 0.75, 1, 1.3 }
 local FOCUS_MOMENTS = { ATTACK = 1.15, DEFENSE = 0.8 }
 
--- Filler lines between chances, by situation (keys in ShotClient/Commentary).
+-- Filler lines between chances (keys in ShotClient/Commentary).
 local FILLER = { "BUILDUP_US", "BUILDUP_THEM", "MIDFIELD", "FOUL_US", "FOUL_THEM", "CORNER_US", "CORNER_THEM", "OFFSIDE_US", "OFFSIDE_THEM", "CROWD", "KEEPER_US", "YELLOW_THEM", "YELLOW_US", "SUB_THEM" }
 local FILLER_ATTACK = { "ME_RUN", "ME_CALL", "TEAM_PRESS" }
 local FILLER_DEFENSE = { "ME_TRACK", "TEAM_DEEP" }
 
-type Event = { minute: number, key: string, number: number? }
 type Match = {
 	career: any,
 	home: CareerConfig.Club,
@@ -69,6 +64,7 @@ type Match = {
 	homeGoals: number,
 	awayGoals: number,
 	momentIndex: number,
+	momentTarget: number,
 	lastMomentSlot: number,
 	usedFiller: { [string]: boolean },
 	effort: number,
@@ -76,7 +72,6 @@ type Match = {
 	stamina: number,
 	tiredSaid: number,
 	active: any?, -- moment episode in play
-	auto: any?, -- good pass waiting for the teammate's shot
 	nextEpisodeId: number,
 	lastRemoteAt: number,
 	lastTacticAt: number,
@@ -91,14 +86,14 @@ local remotes
 local hooks = nil :: { onMatchFinished: (Player, any) -> any }?
 
 local function keeperSkill(match: Match): number
-	return math.clamp(match.away.ovr - 8, 30, 80)
+	return math.clamp(match.away.ovr - 2, 30, 85)
 end
 
 local function edge(match: Match): number
 	return (match.away.ovr - match.home.ovr) * 0.02
 end
 
--- Shooting / passing for the player's own moment: his rating, worn down by low stamina.
+-- Low stamina: less accurate, less time.
 local function freshness(match: Match): number
 	return 0.75 + 0.25 * match.stamina / 100
 end
@@ -106,6 +101,16 @@ end
 local function playerSkill(match: Match, base: number): number
 	local ovr = if typeof(match.career.ovr) == "number" then match.career.ovr else base
 	return math.clamp(math.max(base, ovr) * freshness(match), 20, 90)
+end
+
+local function timeFactor(match: Match): number
+	return (0.85 + 0.075 * match.effort) * freshness(match)
+end
+
+local function gaussian(rng: Random): number
+	local u1 = math.max(rng:NextNumber(), 1e-9)
+	local u2 = rng:NextNumber()
+	return math.sqrt(-2 * math.log(u1)) * math.cos(2 * math.pi * u2)
 end
 
 local function buildSlots(rng: Random): { number }
@@ -137,14 +142,30 @@ local function score(match: Match)
 end
 
 local function state(match: Match)
-	return { stamina = math.floor(match.stamina * 10 + 0.5) / 10, effort = match.effort, focus = match.focus, minute = match.minute }
+	local s = match.stats
+	return {
+		stamina = math.floor(match.stamina * 10 + 0.5) / 10,
+		effort = match.effort,
+		focus = match.focus,
+		minute = match.minute,
+		goals = s.goals,
+		assists = s.assists,
+		shots = s.shots,
+		passes = s.passes,
+		goodPasses = s.goodPasses,
+	}
+end
+
+local function rating(match: Match): number
+	local s = match.stats
+	local r = 6 + s.goals * 1.1 + s.assists * 0.7 + s.goodPasses * 0.12 + s.tackles * 0.15
+		- (s.shots - s.goals) * 0.08 - (s.passes - s.goodPasses) * 0.12 - s.lost * 0.12
+	return math.floor(math.clamp(r, 4, 10) * 10 + 0.5) / 10
 end
 
 local function summary(match: Match)
 	local s = match.stats
 	local outcome = if match.homeGoals > match.awayGoals then "WIN" elseif match.homeGoals == match.awayGoals then "DRAW" else "LOSS"
-	local rating = 6 + s.goals * 1.1 + s.assists * 0.7 + s.goodPasses * 0.15 + s.tackles * 0.15
-		- (s.shots - s.goals) * 0.1 - (s.passes - s.goodPasses) * 0.15 - s.lost * 0.15
 	return {
 		outcome = outcome,
 		home = match.homeGoals,
@@ -154,7 +175,7 @@ local function summary(match: Match)
 		shots = s.shots,
 		passes = s.passes,
 		goodPasses = s.goodPasses,
-		rating = math.floor(math.clamp(rating, 4, 10) * 10 + 0.5) / 10,
+		rating = rating(match),
 		xp = 20 + s.goals * 15 + s.assists * 10 + (if outcome == "WIN" then 20 elseif outcome == "DRAW" then 10 else 0),
 	}
 end
@@ -168,67 +189,39 @@ local function drainTo(match: Match, minute: number)
 	end
 end
 
-local function newEpisode(match: Match, kind: string)
+-- The player's moment: harder later in the match and against better clubs, with more time for a
+-- fresh player who works hard.
+local function newMoment(match: Match, minute: number)
+	local rng = match.rng
+	local seed = rng:NextInteger(1, 2 ^ 31 - 1)
+	local difficulty = match.momentIndex / MOMENTS_MAX + (match.away.ovr - 60) / 60
+	local defenders = if rng:NextNumber() < 0.3 + difficulty * 0.35 then 3 else 2
+	local receive = rng:NextNumber() < 0.5
 	local episode = {
 		id = match.nextEpisodeId,
-		kind = kind,
-		mode = "MATCH",
-		seed = match.rng:NextInteger(1, 2 ^ 31 - 1),
-		startedAt = os.clock(),
-		match = { keeperSkill = keeperSkill(match) },
+		kind = "MOMENT",
+		seed = seed,
+		minute = minute,
+		stepRng = Random.new(seed + 1),
+		layout = MomentPhysics.layout(Random.new(seed), { receive = receive, defenders = defenders, timeFactor = timeFactor(match) }),
+		readyAt = nil :: number?,
+		token = 0,
 	}
 	match.nextEpisodeId += 1
 	return episode
 end
 
-local function episodePayload(episode, stage: string)
-	return {
-		episodeId = episode.id,
-		kind = episode.kind,
-		mode = episode.mode,
-		layout = episode.layout,
-		spot = episode.match.spot,
-		match = true,
-		-- Fields the training HUD code reads; its training panels are hidden in a match.
-		stage = stage,
-		goals = 0,
-		shots = 0,
-		bonusGoals = 0,
-		taskGoals = 1,
-		history = {},
-	}
-end
-
--- The player's moment: a situation outside the box, harder later in the match and against better
--- clubs, with more time for a fresh player who works hard.
-local function newMoment(match: Match)
-	local rng = match.rng
-	local episode = newEpisode(match, "MOMENT")
-	local difficulty = match.momentIndex / MOMENTS_MAX + (match.away.ovr - 60) / 60
-	local defenders = if rng:NextNumber() < 0.35 + difficulty * 0.4 then 3 else 2
-	local timeFactor = (0.8 + 0.1 * match.effort) * freshness(match)
-	episode.layout = MomentPhysics.layout(Random.new(episode.seed), {
-		receive = rng:NextNumber() < 0.5,
-		defenders = defenders,
-		timeFactor = timeFactor,
-	})
-	episode.readyAt = nil :: number?
-	return episode
-end
-
-local tackle -- defined below
-
 -- What happens in one slot of the timeline, rolled now so the current tactics count.
 local function rollSlot(match: Match, slotIndex: number, minute: number, sent: { any }): any?
 	local rng = match.rng
 	local remaining = SLOTS - slotIndex
-	local needed = MOMENTS_MIN - match.momentIndex
+	local needed = match.momentTarget - match.momentIndex
 	local spaced = slotIndex - match.lastMomentSlot >= 2
-	local chance = MOMENT_CHANCE * EFFORT_MOMENTS[match.effort] * (FOCUS_MOMENTS[match.focus] or 1) * (if match.stamina < 25 then 0.7 else 1)
+	local chance = MOMENT_CHANCE * EFFORT_MOMENTS[match.effort] * (FOCUS_MOMENTS[match.focus] or 1) * (if match.stamina < 25 then 0.75 else 1)
 	local isMoment = match.momentIndex < MOMENTS_MAX
 		and spaced
 		and slotIndex > 1
-		and (needed > 0 and remaining < needed * 2 or rng:NextNumber() < chance)
+		and ((needed > 0 and remaining < needed * 2) or rng:NextNumber() < chance)
 	local function line(key: string, number: number?)
 		table.insert(sent, { minute = minute, key = key, number = number, score = score(match) })
 	end
@@ -236,7 +229,13 @@ local function rollSlot(match: Match, slotIndex: number, minute: number, sent: {
 	if isMoment then
 		match.momentIndex += 1
 		match.lastMomentSlot = slotIndex
-		return newMoment(match)
+		local moment = newMoment(match, minute)
+		-- The build-up: who has it and how, then the call to play.
+		local layout = moment.layout
+		table.insert(sent, { minute = minute, key = "CHANCE", score = score(match), chance = true })
+		line(if layout.kind == "RECEIVE" then "BUILD_RECEIVE" else "BUILD_ONBALL", TEAMMATE_NUMBERS[2])
+		line("PROMPT")
+		return moment
 	end
 
 	local e = edge(match)
@@ -292,9 +291,19 @@ local function rollSlot(match: Match, slotIndex: number, minute: number, sent: {
 	return nil
 end
 
+local function momentPayload(match: Match, episode)
+	return {
+		kind = episode.layout.kind,
+		minute = episode.minute,
+		index = match.momentIndex,
+		number = TEAMMATE_NUMBERS[2],
+		episode = { episodeId = episode.id, kind = "MOMENT", layout = episode.layout },
+	}
+end
+
 -- Sends the next slot of the timeline (with any whistle before it), or full time with the result.
 local function advance(player: Player, match: Match)
-	if match.finished or match.active or match.auto then
+	if match.finished or match.active then
 		return
 	end
 	local sent = {}
@@ -322,19 +331,7 @@ local function advance(player: Player, match: Match)
 		local moment = rollSlot(match, slotIndex, minute, sent)
 		if moment then
 			match.active = moment
-			local layout = moment.layout
-			remotes.MatchUpdate:FireClient(player, {
-				events = sent,
-				score = score(match),
-				state = state(match),
-				moment = {
-					kind = layout.kind,
-					minute = minute,
-					index = match.momentIndex,
-					number = PASSER_NUMBER,
-					episode = episodePayload(moment, "MOMENT"),
-				},
-			})
+			remotes.MatchUpdate:FireClient(player, { events = sent, score = score(match), state = state(match), moment = momentPayload(match, moment) })
 			return
 		end
 		remotes.MatchUpdate:FireClient(player, { events = sent, score = score(match), state = state(match) })
@@ -354,45 +351,10 @@ local function advance(player: Player, match: Match)
 	matches[player] = nil
 end
 
--- After your good pass or cross: the teammate shoots (heads a cross). Aim and power are his own.
-local function autoShot(player: Player, match: Match)
-	local auto = match.auto
-	if not auto then
-		return
-	end
-	match.auto = nil
-	local rng = match.rng
-	local episode = newEpisode(match, "SHOT")
-	episode.mode = "AUTO"
-	local side = if rng:NextNumber() < 0.5 then -1 else 1
-	local input
-	if auto.header then
-		input = { aimX = side * (0.25 + rng:NextNumber() * 0.65), aimY = rng:NextNumber() * 0.45, power = 0.2 + rng:NextNumber() * 0.3 }
-	else
-		input = { aimX = side * (0.35 + rng:NextNumber() * 0.5), aimY = 0.15 + rng:NextNumber() * 0.6, power = 0.55 + rng:NextNumber() * 0.3 }
-	end
-	local stats = { shooting = math.clamp(match.home.ovr - (if auto.header then 18 else 12), 25, 80), keeperSkill = keeperSkill(match) }
-	local distance = Vector3.new(auto.spot.X, 0, auto.spot.Z).Magnitude
-	local result = ShotResolver.resolve(input, stats, Random.new(episode.seed), {
-		start = auto.spot,
-		scatterScale = math.max(1, distance / Moment.FinishScatterDistance),
-	})
+local function shotPayload(result, spot: Vector3)
 	local sim = result.sim
-	local goal = result.outcome == "GOAL"
-	if goal then
-		match.homeGoals += 1
-		match.stats.assists += 1
-	end
-	local payload = episodePayload(episode, "SHOT")
-	payload.spot = auto.spot
-	payload.receiver = auto.receiver
-	payload.header = auto.header
-	-- Same fields as an EpisodeResult for a shot: the client replays this path.
-	payload.auto = {
-		episodeId = episode.id,
-		kind = "SHOT",
-		mode = "AUTO",
-		header = auto.header,
+	return {
+		spot = spot,
 		path = sim.path,
 		sampleStep = ShotConfig.Physics.SampleStep,
 		events = sim.events,
@@ -407,16 +369,39 @@ local function autoShot(player: Player, match: Match)
 		outcome = result.outcome,
 		detail = result.detail,
 		speedKmh = result.speedKmh,
-		number = TEAMMATE_NUMBERS[auto.receiver] or TEAMMATE_NUMBERS[1],
-		score = score(match),
 	}
-	remotes.EpisodeStarted:FireClient(player, payload)
 end
 
-local function sendResult(player: Player, match: Match, active, payload)
-	payload.episodeId = active.id
+-- A teammate finishes your pass (a header if it came in high). A goal is your assist.
+local function teammateFinish(match: Match, episode, receiver: number, spot: Vector3, header: boolean)
+	local rng = episode.stepRng
+	local side = if rng:NextNumber() < 0.5 then -1 else 1
+	local input
+	if header then
+		input = { aimX = side * (0.25 + rng:NextNumber() * 0.65), aimY = rng:NextNumber() * 0.45, power = 0.2 + rng:NextNumber() * 0.3 }
+	else
+		input = { aimX = side * (0.35 + rng:NextNumber() * 0.5), aimY = 0.15 + rng:NextNumber() * 0.6, power = 0.55 + rng:NextNumber() * 0.3 }
+	end
+	local stats = { shooting = math.clamp(match.home.ovr - (if header then 18 else 12), 25, 80), keeperSkill = keeperSkill(match) }
+	local distance = Vector3.new(spot.X, 0, spot.Z).Magnitude
+	local result = ShotResolver.resolve(input, stats, Random.new(rng:NextInteger(1, 2 ^ 31 - 1)), {
+		start = spot,
+		scatterScale = math.max(1, distance / Moment.FinishScatterDistance),
+	})
+	if result.outcome == "GOAL" then
+		match.homeGoals += 1
+		match.stats.assists += 1
+	end
+	local payload = shotPayload(result, spot)
+	payload.receiver = receiver
+	payload.header = header
+	payload.number = TEAMMATE_NUMBERS[receiver]
+	return payload
+end
+
+local function sendResult(player: Player, match: Match, episode, payload)
+	payload.episodeId = episode.id
 	payload.kind = "MOMENT"
-	payload.mode = "MATCH"
 	payload.match = true
 	payload.score = score(match)
 	payload.state = state(match)
@@ -424,31 +409,35 @@ local function sendResult(player: Player, match: Match, active, payload)
 end
 
 -- Too late: the presser gets there first.
-function tackle(player: Player, match: Match, active)
-	if match.active ~= active then
+local function tackle(player: Player, match: Match, episode)
+	if match.active ~= episode then
 		return
 	end
 	match.active = nil
 	match.stats.lost += 1
-	sendResult(player, match, active, { action = "TACKLE", outcome = "TACKLED", detail = "TACKLED", tackler = active.layout.tackler })
+	sendResult(player, match, episode, { step = episode.layout.step, action = "TACKLE", outcome = "TACKLED", detail = "TACKLED", tackler = episode.layout.tackler })
 end
 
--- The intro is over on the client: the decision clock starts, and the tackle is scheduled.
-local function onReady(player: Player, match: Match)
-	local active = match.active
-	if not active or active.readyAt then
+-- The step's intro is over on the client: the decision clock starts, and the tackle is scheduled
+-- (aiming time plus the strike screen, plus network slack).
+local function onReady(player: Player, match: Match, step: any)
+	local episode = match.active
+	if not episode or episode.readyAt or step ~= episode.layout.step then
 		return
 	end
-	active.readyAt = os.clock()
-	task.delay(active.layout.tackleTime + Moment.TackleGrace, function()
-		if matches[player] == match then
-			tackle(player, match, active)
+	episode.readyAt = os.clock()
+	episode.token += 1
+	local token = episode.token
+	local deadline = episode.layout.tackleTime + Moment.StrikeTime + Moment.MaxLag + Moment.Grace
+	task.delay(deadline, function()
+		if matches[player] == match and match.active == episode and episode.token == token then
+			tackle(player, match, episode)
 		end
 	end)
 end
 
 local function setEffort(match: Match, value: any)
-	if typeof(value) == "number" and (value == 1 or value == 2 or value == 3) then
+	if typeof(value) == "number" and (value == 1 or value == 2 or value == 3) and not (value > 1 and match.stamina <= 0) then
 		match.effort = value
 	end
 end
@@ -479,183 +468,170 @@ local function onRequest(player: Player, action: any, value: any)
 		return
 	end
 	if action == "READY" then
-		onReady(player, match) -- once per moment, so no rate limit needed
+		onReady(player, match, value) -- once per step, so no rate limit needed
 		return
 	end
-	if not passesRateLimit(match) then
-		return
-	end
-	if action == "NEXT" then
+	if action == "NEXT" and passesRateLimit(match) then
 		advance(player, match)
-	elseif action == "AUTO" then
-		autoShot(player, match)
 	end
+end
+
+local function isNumber(value: any, min: number, max: number): boolean
+	return typeof(value) == "number" and value == value and value >= min and value <= max
 end
 
 local function reject(player: Player, episodeId: any, reason: string)
-	warn(string.format("[MatchService] %s: rejected input for episode %s (%s)", player.Name, tostring(episodeId), reason))
-	remotes.EpisodeResult:FireClient(player, { episodeId = if typeof(episodeId) == "number" then episodeId else nil, rejected = true, reason = reason, match = true })
+	warn(string.format("[MatchService] %s: rejected moment input %s (%s)", player.Name, tostring(episodeId), reason))
+	remotes.EpisodeResult:FireClient(player, { episodeId = if typeof(episodeId) == "number" then episodeId else nil, kind = "MOMENT", rejected = true, reason = reason, match = true })
 end
 
-local function resolveMomentShot(match: Match, active, aimX: number, aimY: number, power: number)
-	local layout = active.layout
-	local input = { aimX = math.clamp(aimX, -1, 1), aimY = math.clamp(aimY, 0, 1), power = math.clamp(power, 0, 1) }
-	local stats = { shooting = playerSkill(match, ShotConfig.DefaultShooting), keeperSkill = keeperSkill(match) }
-	local result = ShotResolver.resolve(input, stats, Random.new(active.seed), {
-		start = MomentPhysics.shotSpot(layout),
-		scatterScale = MomentPhysics.shotScatterScale(layout),
-		keeperDelay = MomentPhysics.shotKeeperDelay(layout),
-	})
-	local sim = result.sim
-	return result.outcome, result.detail, result.speedKmh, {
-		spot = MomentPhysics.shotSpot(layout),
-		path = sim.path,
-		sampleStep = ShotConfig.Physics.SampleStep,
-		events = sim.events,
-		spin = result.spin,
-		held = sim.held,
-		decisiveTime = result.decisiveTime,
-		keeperTime = sim.keeperTime,
-		keeperTarget = result.keeperTarget,
-		keeperReaction = result.keeperReaction,
-		keeperDives = result.keeperDives,
-		keeperKind = sim.keeperKind,
-	}
-end
-
-local function gaussian(rng: Random): number
-	local u1 = math.max(rng:NextNumber(), 1e-9)
-	local u2 = rng:NextNumber()
-	return math.sqrt(-2 * math.log(u1)) * math.cos(2 * math.pi * u2)
-end
-
-local function resolveMomentPass(match: Match, active, dirX: number, dirZ: number, power: number, releaseTime: number, high: boolean)
-	local rng = Random.new(active.seed)
-	local accuracy = PassConfig.Accuracy
-	local skill = playerSkill(match, PassConfig.DefaultPassing) / 100
-	local cap = accuracy.MaxSigmas
-	local angleSigma = accuracy.AngleAtZeroSkill + (accuracy.AngleAtMaxSkill - accuracy.AngleAtZeroSkill) * skill
-	local distanceSigma = accuracy.DistanceAtZeroSkill + (accuracy.DistanceAtMaxSkill - accuracy.DistanceAtZeroSkill) * skill
-	if high then
-		angleSigma *= Moment.CrossAngleScale
-		distanceSigma *= Moment.CrossDistanceScale
-	end
-	local angle = math.rad(math.clamp(gaussian(rng), -cap, cap) * angleSigma)
-	local stretch = 1 + math.clamp(gaussian(rng), -cap, cap) * distanceSigma
-	local reaction = PassConfig.Defender.Reaction + (rng:NextNumber() * 2 - 1) * PassConfig.Defender.ReactionJitter
-
-	local dir = Vector3.new(dirX, 0, dirZ).Unit
-	local c, s = math.cos(angle), math.sin(angle)
-	dir = Vector3.new(dir.X * c - dir.Z * s, 0, dir.X * s + dir.Z * c)
-	local distance
-	if high then
-		distance = math.clamp(power * Moment.CrossMaxRange, Moment.CrossMinRange, Moment.CrossMaxRange) * stretch
-	else
-		distance = PassPhysics.distanceForPower(power) * stretch
-	end
-	local sim = MomentPhysics.simulatePass(active.layout, dir, distance, releaseTime, reaction, high)
-	return sim
-end
-
-local function onSubmit(player: Player, episodeId: any, a: any, b: any, power: any, clientTime: any, action: any)
+local function onMomentInput(player: Player, episodeId: any, step: any, dirX: any, dirZ: any, length: any, hitX: any, hitY: any, aimTime: any)
 	local match = matches[player]
 	if not match then
 		return
 	end
-	local active = match.active
-	if not active or episodeId ~= active.id then
-		reject(player, episodeId, "unknown or already finished episode")
+	local episode = match.active
+	if not episode or episodeId ~= episode.id or step ~= episode.layout.step then
+		reject(player, episodeId, "unknown or already finished step")
 		return
 	end
 	if not passesRateLimit(match) then
 		reject(player, episodeId, "too many requests")
 		return
 	end
-	local inRange = EpisodeService.isNumberInRange
-	local shot = action == "SHOT"
-	if not (shot or action == "PASS" or action == "CROSS") then
-		reject(player, episodeId, "unknown action")
-		return
-	end
-	if not (inRange(a, -1, 1) and inRange(b, if shot then 0 else -1, 1) and inRange(power, 0, 1)) then
+	if not (isNumber(dirX, -1, 1) and isNumber(dirZ, -1, 1) and isNumber(length, 0, 1000) and isNumber(hitX, -1.5, 1.5) and isNumber(hitY, -1.5, 1.5)) then
 		reject(player, episodeId, "invalid input values")
 		return
 	end
-	if not active.readyAt then
-		reject(player, episodeId, "input before the moment started")
+	local dir = Vector3.new(dirX, 0, dirZ)
+	if dir.Magnitude < 0.5 or not episode.readyAt then
+		reject(player, episodeId, "invalid input values")
 		return
 	end
-	local elapsed = os.clock() - active.readyAt
-	if elapsed < 0.15 then
-		reject(player, episodeId, "input too early")
-		return
-	end
-	-- When it was played: the client's clock, never ahead of ours or more than MaxLag behind.
-	local releaseTime = elapsed
-	if typeof(clientTime) == "number" and clientTime == clientTime then
-		releaseTime = math.clamp(clientTime, math.max(0, elapsed - Moment.MaxLag), elapsed)
-	end
-	if releaseTime > active.layout.tackleTime then
-		tackle(player, match, active)
+	dir = dir.Unit
+	local layout = episode.layout
+	local elapsed = os.clock() - episode.readyAt
+	-- When the arrow was let go: the client's clock, never ahead of ours and no older than the
+	-- strike screen plus lag allows.
+	local earliest = math.max(0, elapsed - Moment.StrikeTime - Moment.MaxLag - Moment.Grace)
+	local released = if isNumber(aimTime, 0, 1000) then math.clamp(aimTime, earliest, elapsed) else earliest
+	if released > layout.tackleTime + Moment.Grace then
+		tackle(player, match, episode)
 		return
 	end
 
-	-- Consume the episode once it has a result, so it can never produce a second one.
-	match.active = nil
+	-- This step is used up whatever happens next.
+	episode.token += 1
+	episode.readyAt = nil
 	local stats = match.stats
-	local payload
-	if shot then
-		local outcome, detail, speedKmh, shotPayload = resolveMomentShot(match, active, a, b, power)
-		payload = shotPayload
-		payload.action = "SHOT"
-		payload.outcome, payload.detail, payload.speedKmh = outcome, detail, speedKmh
+	local length_ = math.clamp(length, Moment.MinArrow, Moment.MaxArrow)
+	local target = layout.carrier + dir * length_
+	local strike = MomentPhysics.strike(hitX, hitY)
+	local rng = episode.stepRng
+
+	if MomentPhysics.classify(layout, target) == "SHOT" then
+		match.active = nil
+		local shot = MomentPhysics.shotInput(layout, target, strike, math.max(0, -target.Z))
+		local spot = MomentPhysics.shotSpot(layout)
+		local result = ShotResolver.resolve({ aimX = shot.aimX, aimY = shot.aimY, power = shot.power }, {
+			shooting = playerSkill(match, ShotConfig.DefaultShooting),
+			keeperSkill = keeperSkill(match),
+		}, Random.new(rng:NextInteger(1, 2 ^ 31 - 1)), {
+			start = spot,
+			scatterScale = shot.scatterScale,
+			keeperDelay = shot.keeperDelay,
+			aimPoint = shot.aimPoint,
+			spin = shot.spin,
+		})
 		stats.shots += 1
-		if outcome == "GOAL" then
+		local payload = shotPayload(result, spot)
+		-- Straight at a defender: blocked, whatever the keeper would have done.
+		local blockIndex, blocker = MomentPhysics.blockShot(layout, result.sim.path, released)
+		if blockIndex then
+			local path = table.move(result.sim.path, 1, blockIndex, 1, {})
+			local at = path[blockIndex]
+			local incoming = (at - path[math.max(1, blockIndex - 1)]) / ShotConfig.Physics.SampleStep
+			for i, p in MomentPhysics.deflect(at, incoming, rng) do
+				if i > 1 then
+					table.insert(path, p)
+				end
+			end
+			local blockTime = (blockIndex - 1) * ShotConfig.Physics.SampleStep
+			payload.path = path
+			payload.events = { { kind = "bounce", t = blockTime, pos = at } }
+			payload.held = false
+			payload.keeperKind = nil
+			payload.keeperTime = nil
+			payload.keeperDives = false
+			payload.keeperTarget = Vector3.new(ShotConfig.Goalkeeper.HomeX, ShotConfig.Goalkeeper.HomeY, 0)
+			payload.decisiveTime = blockTime + 0.15
+			payload.outcome = "MISS"
+			payload.detail = "BLOCKED"
+			payload.blocker = blocker
+			payload.blockTime = blockTime
+		elseif result.outcome == "GOAL" then
 			stats.goals += 1
 			match.homeGoals += 1
 		end
-	else
-		if Vector3.new(a, 0, b).Magnitude < 0.1 then
-			match.active = active
-			reject(player, episodeId, "invalid input values")
-			return
-		end
-		local high = action == "CROSS"
-		local sim = resolveMomentPass(match, active, a, b, power, releaseTime, high)
-		stats.passes += 1
-		payload = {
-			action = action,
-			outcome = sim.outcome,
-			detail = sim.detail,
-			speedKmh = math.floor(sim.speed + 0.5),
-			releaseTime = releaseTime,
-			sampleStep = PassConfig.SampleStep,
-			ball = sim.ball,
-			defenders = sim.defenders,
-			mates = sim.mates,
-			receiver = sim.receiver,
-			interceptor = sim.interceptor,
-			header = sim.header,
-			eventTime = sim.eventTime,
-			endTime = sim.endTime,
-			number = sim.receiver and TEAMMATE_NUMBERS[sim.receiver],
-		}
-		if sim.detail == "GOOD" and sim.receiver and sim.meet then
-			stats.goodPasses += 1
-			local spot
-			if sim.header then
-				spot = Vector3.new(sim.meet.X, Moment.HeaderHeight, sim.meet.Z)
-			else
-				-- The receiver takes a touch towards goal and shoots.
-				local toGoal = Vector3.new(-sim.meet.X, 0, -sim.meet.Z).Unit
-				local ground = sim.meet + toGoal * PassConfig.Teammate.Reach * 0.7
-				spot = Vector3.new(ground.X, ShotConfig.Ball.Radius, ground.Z)
-			end
-			match.auto = { spot = spot, receiver = sim.receiver, header = sim.header }
-			payload.followUp = true
-		end
+		payload.step = layout.step
+		payload.action = "SHOT"
+		payload.target = target
+		payload.strike = strike
+		sendResult(player, match, episode, payload)
+		return
 	end
-	sendResult(player, match, active, payload)
+
+	-- A pass: your skill and how cleanly you struck it decide how true it runs.
+	local accuracy = PassConfig.Accuracy
+	local skill = playerSkill(match, PassConfig.DefaultPassing) / 100
+	local sloppy = (1 + 2.2 * strike.scuff) * (if strike.lofted then 1.4 else 1)
+	local cap = accuracy.MaxSigmas
+	local angle = math.rad(math.clamp(gaussian(rng), -cap, cap) * (accuracy.AngleAtZeroSkill + (accuracy.AngleAtMaxSkill - accuracy.AngleAtZeroSkill) * skill) * sloppy)
+	local stretch = 1 + math.clamp(gaussian(rng), -cap, cap) * (accuracy.DistanceAtZeroSkill + (accuracy.DistanceAtMaxSkill - accuracy.DistanceAtZeroSkill) * skill) * sloppy
+	local reaction = Moment.DefReaction + (rng:NextNumber() * 2 - 1) * 0.05
+	local c, s = math.cos(angle), math.sin(angle)
+	local passDir = Vector3.new(dir.X * c - dir.Z * s, 0, dir.X * s + dir.Z * c)
+	local distance = math.min(length_, Moment.MaxPassRange) * stretch * (1 - 0.3 * strike.scuff)
+	local start = layout.carrier + Vector3.new(0, ShotConfig.Ball.Radius, 0)
+	local v0, spin = MomentPhysics.launch(start, passDir, distance, strike)
+	local sim = MomentPhysics.simulatePass(layout, v0, spin, released, reaction)
+	stats.passes += 1
+	local payload = {
+		step = layout.step,
+		action = "PASS",
+		lofted = strike.lofted,
+		strike = strike,
+		target = target,
+		detail = sim.detail,
+		outcome = sim.outcome,
+		releaseTime = released,
+		sampleStep = MomentPhysics.SampleStep,
+		ball = sim.ball,
+		defenders = sim.defenders,
+		mates = sim.mates,
+		receiver = sim.receiver,
+		interceptor = sim.interceptor,
+		header = sim.header,
+		eventTime = sim.eventTime,
+		endTime = sim.endTime,
+		number = sim.receiver and TEAMMATE_NUMBERS[sim.receiver],
+	}
+	if sim.detail == "GOOD" and sim.receiver and sim.meet then
+		stats.goodPasses += 1
+		local receiver = sim.receiver
+		if MomentPhysics.shouldFinish(sim.meet) or layout.step >= Moment.MaxSteps then
+			match.active = nil
+			payload.finish = teammateFinish(match, episode, receiver, MomentPhysics.finishSpot(sim.meet, sim.header), sim.header)
+		else
+			-- One-two: he plays it straight back into your run.
+			local nextLayout = MomentPhysics.oneTwo(rng, layout, receiver, sim.mateEnd[receiver], sim.defenderEnd, timeFactor(match))
+			episode.layout = nextLayout
+			payload.continue = { layout = nextLayout }
+		end
+	else
+		match.active = nil
+	end
+	sendResult(player, match, episode, payload)
 end
 
 -- CareerService "START_MATCH": a new match against the career's next opponent.
@@ -678,6 +654,7 @@ function MatchService.start(player: Player, career: any)
 		homeGoals = 0,
 		awayGoals = 0,
 		momentIndex = 0,
+		momentTarget = rng:NextInteger(MOMENTS_MIN, MOMENTS_MAX - 1),
 		lastMomentSlot = -10,
 		usedFiller = {},
 		effort = 2,
@@ -708,14 +685,10 @@ function MatchService.init(remoteEvents, matchHooks)
 	remotes = remoteEvents
 	hooks = matchHooks
 	remotes.MatchRequest.OnServerEvent:Connect(onRequest)
-	remotes.SubmitEpisodeInput.OnServerEvent:Connect(onSubmit)
+	remotes.MomentInput.OnServerEvent:Connect(onMomentInput)
 	Players.PlayerRemoving:Connect(function(player)
 		matches[player] = nil
 	end)
 end
-
--- Exposed for offline balance checks (tools/sim).
-MatchService._buildSlots = buildSlots
-MatchService._rollSlot = rollSlot
 
 return MatchService
