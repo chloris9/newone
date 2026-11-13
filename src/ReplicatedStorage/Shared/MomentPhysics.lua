@@ -49,7 +49,6 @@ MomentPhysics.Config = {
 	MaxLoft = 48,
 	SideSpin = 8, -- rad/s at a full side hit (hit the right side: it curls left)
 	TopSpin = 6,
-	ShotCurlShift = 6, -- studs the end of a shot moves at a full side hit
 	-- Ball on the grass
 	Friction = 18,
 	Overrun = 5,
@@ -73,8 +72,10 @@ MomentPhysics.Config = {
 	DefHeaderHeight = 6.4,
 	OpenLane = 5, -- a teammate is "calling" when no defender is this close to the lane
 	-- Shots
-	ShotScatterPerStud = 1 / ShotConfig.ShotDistance,
-	LongShotKeeperDelayPerStud = 0.006,
+	ShotScatterBase = 0.2, -- spread (x the shooter's skill spread) of a clean strike...
+	ShotScatterPerStud = 0.006, -- ...growing a little with distance
+	ShotSideSpin = 10, -- side spin boost on shots, so the curl is plain to see
+	LongShotKeeperDelayPerStud = 0.0035, -- long shots: the keeper is a little late, not hopeless
 	FinishScatterDistance = 26,
 	HeaderSpotHeight = 6.2,
 	BlockRange = 26, -- defenders can block a shot in its first studs
@@ -382,6 +383,9 @@ local function spinVector(dir: Vector3, s: Strike): Vector3
 end
 
 -- Shot for ShotResolver: the point on the goal plane it is aimed at, power, spin and scatter.
+-- The ball ends where the arrow crosses the goal line (give or take a little, more if you scuff
+-- it); where you hit the ball decides how it gets there: low = higher, high = lower, a side = it
+-- curls (starting out wide and bending back in, round a defender if need be).
 function MomentPhysics.shotInput(layout: Layout, target: Vector3, s: Strike, over: number)
 	local from = layout.carrier
 	local k = from.Z / math.max(from.Z - target.Z, 1e-3)
@@ -390,19 +394,19 @@ function MomentPhysics.shotInput(layout: Layout, target: Vector3, s: Strike, ove
 	local height = 0.3 - s.hitY * 0.85
 	local dir = unit(flat(target - from), Vector3.new(0, 0, -1))
 	local distance = flat(from).Magnitude
-	-- Hit the right side: it bends left (towards -X when going up the pitch).
-	local shift = -s.hitX * C.ShotCurlShift * math.clamp(distance / 50, 0.4, 1.2) * (-dir.Z)
 	local goalHeight = ShotConfig.Goal.Height
 	local y = BALL_RADIUS + math.clamp(height, 0, 1) * (goalHeight - 2 * BALL_RADIUS) + math.max(0, height - 1) * 8
-	local aimX = math.clamp((crossX + shift) / (GOAL_HALF_WIDTH - BALL_RADIUS), -1, 1)
+	local aimX = math.clamp(crossX / (GOAL_HALF_WIDTH - BALL_RADIUS), -1, 1)
+	local spin = spinVector(dir, s)
 	return {
 		aimX = aimX,
 		aimY = math.clamp(height, 0, 1),
-		aimPoint = Vector3.new(crossX + shift, y, 0),
+		aimPoint = Vector3.new(crossX, y, 0),
 		power = math.clamp(0.74 + 0.22 * math.clamp(over / 14, 0, 1) + (if s.hitY > 0 then 0.06 * s.hitY else 0) - 0.3 * s.scuff, 0.3, 1),
-		spin = spinVector(dir, s) * 0.6,
-		scatterScale = math.max(1, distance * C.ShotScatterPerStud) * (1 + 1.6 * s.scuff),
+		spin = Vector3.new(0, spin.Y * C.ShotSideSpin, 0) + Vector3.new(spin.X, 0, spin.Z) * 0.6,
+		scatterScale = (C.ShotScatterBase + distance * C.ShotScatterPerStud) * (1 + 2.5 * s.scuff),
 		keeperDelay = math.max(0, distance - ShotConfig.ShotDistance) * C.LongShotKeeperDelayPerStud,
+		steady = true,
 	}
 end
 
