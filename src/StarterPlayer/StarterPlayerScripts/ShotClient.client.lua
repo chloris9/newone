@@ -7,6 +7,17 @@ local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
+local StarterGui = game:GetService("StarterGui")
+
+-- A single-player career: Roblox's player list only covers the HUD's top-right corner.
+task.spawn(function()
+	for _ = 1, 20 do
+		if pcall(StarterGui.SetCoreGuiEnabled, StarterGui, Enum.CoreGuiType.PlayerList, false) then
+			return
+		end
+		task.wait(0.5)
+	end
+end)
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local ShotConfig = require(Shared:WaitForChild("ShotConfig"))
@@ -365,7 +376,7 @@ local PASS_KEYS = { INTERCEPTED = "PASS_FAIL", CLEARED = "CROSS_CLEARED", ASTRAY
 local function playMatchShot(result, shooter, key: string, header: boolean?)
 	momentVisuals:handOffShot(shooter, result.spot, header)
 	visuals:reset(result.spot)
-	visuals:setCameraEnabled(true)
+	visuals:setCameraEnabled(false) -- the moment's own shot camera, high behind the shooter
 	visuals:onShotReleased()
 	if result.detail == "BLOCKED" then
 		task.delay(math.max(0, (result.blockTime or 0) - 0.15), function()
