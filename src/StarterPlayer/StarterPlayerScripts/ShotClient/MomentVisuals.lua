@@ -31,6 +31,15 @@ local DECIDE_FOV = 50
 local CAMERA_PITCH = 40 -- degrees below the horizon on the pitch view
 local STRIKE_FOV = 38
 local STRIKE_DISTANCE = 5.4 -- camera behind the ball on the strike screen
+-- Shots in a moment: high behind the shooter, so the goal stays in view over everyone's heads.
+local SHOT_FOV = 50
+local SHOT_BACK = 12
+local SHOT_HEIGHT = 11
+local GOAL_MOUTH = Vector3.new(0, 4, 0)
+-- Players between the camera and the play turn see-through.
+local FADE = 0.7
+local FADE_RADIUS = 3.2
+local FADE_NEAR = 9
 local MATE_TARGET_RADIUS = 6 -- the arrow "points at" a teammate this close to its end
 
 local rgb = Color3.fromRGB
@@ -239,18 +248,41 @@ function MomentVisuals:setPlayer(number: number, surname: string)
 	FigureBuilder.setPrints(self.me.model, number, surname)
 end
 
+local function applyLook(animator)
+	local hidden = animator.hidden
+	local fade = animator.fade or 0
+	for _, part in animator.hideParts do
+		if part:IsA("SurfaceGui") then
+			part.Enabled = not hidden and fade < 0.3
+		else
+			part.LocalTransparencyModifier = if hidden then 1 else fade
+		end
+	end
+end
+
 local function setHidden(animator, hidden: boolean)
 	if animator.hidden == hidden then
 		return
 	end
 	animator.hidden = hidden
-	for _, part in animator.hideParts do
-		if part:IsA("SurfaceGui") then
-			part.Enabled = not hidden
-		else
-			part.LocalTransparencyModifier = if hidden then 1 else 0
-		end
+	applyLook(animator)
+end
+
+local function setFade(animator, fade: number)
+	if math.abs((animator.fade or 0) - fade) < 0.01 then
+		return
 	end
+	animator.fade = fade
+	if not animator.hidden then
+		applyLook(animator)
+	end
+end
+
+-- Distance from p to the segment a-b, and how far along it p lies (0..1).
+local function segmentDistance(p: Vector3, a: Vector3, b: Vector3): (number, number)
+	local ab = b - a
+	local t = math.clamp((p - a):Dot(ab) / math.max(ab:Dot(ab), 1e-6), 0, 1)
+	return (p - (a + ab * t)).Magnitude, t
 end
 
 function MomentVisuals:_setBall(position: Vector3)
