@@ -101,11 +101,11 @@ local function addDecal(part: BasePart, face: string, image: string)
 	decal.Parent = part
 end
 
--- Where the painted-out numbers were on the PlayerMain sheet, as fractions of the face.
+-- Where the painted-out numbers are on the PlayerMain / RivalPlain sheets, as fractions of the face.
 local PRINTS = {
-	{ part = "UpperTorso", face = Enum.NormalId.Front, name = "ChestNumber", box = { 0.29, 0.34, 0.42, 0.64 } },
-	{ part = "UpperTorso", face = Enum.NormalId.Back, name = "BackNumber", box = { 0.18, 0.3, 0.64, 0.7 } },
-	{ part = "LeftUpperLeg", face = Enum.NormalId.Front, name = "ShortsNumber", box = { 0.4, 0.1, 0.52, 0.58 } },
+	{ part = "UpperTorso", face = Enum.NormalId.Front, name = "ChestNumber", box = { 0.30, 0.42, 0.40, 0.42 } },
+	{ part = "UpperTorso", face = Enum.NormalId.Back, name = "BackNumber", box = { 0.22, 0.32, 0.56, 0.60 } },
+	{ part = "LeftUpperLeg", face = Enum.NormalId.Front, name = "ShortsNumber", box = { 0.38, 0.35, 0.40, 0.40 } },
 }
 
 local function printLabel(gui: Instance, name: string, box: { number }, text: string, color: Color3): TextLabel

@@ -2,6 +2,8 @@
 --   SHOT: press on the goal to aim (X -1..1, Y 0..1), hold to charge the power meter, release.
 --   PASS: press and drag; the point on the grass under the finger is where the ball goes, its
 --         distance from the ball is the power. Release to pass (drags shorter than MinRange cancel).
+--   MOMENT (match): both. A press on or around the goal is a SHOT; anywhere else a PASS drag, or a
+--         CROSS (high ball) while highBall is on. onShoot gets the action as its 4th argument.
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local UserInputService = game:GetService("UserInputService")
@@ -10,6 +12,11 @@ local Shared = ReplicatedStorage:WaitForChild("Shared")
 local ShotConfig = require(Shared:WaitForChild("ShotConfig"))
 local ShotPhysics = require(Shared:WaitForChild("ShotPhysics"))
 local PassConfig = require(Shared:WaitForChild("PassConfig"))
+local MomentPhysics = require(Shared:WaitForChild("MomentPhysics"))
+
+-- MOMENT: presses this close to the goal frame (studs on the goal plane) count as a shot.
+local SHOT_ZONE_MARGIN_X = 7
+local SHOT_ZONE_MARGIN_Y = 5
 
 local InputController = {}
 InputController.__index = InputController
@@ -34,8 +41,10 @@ function InputController.new()
 		power = 0,
 		target = nil :: Vector3?, -- PASS: drop point on the ground
 		passOrigin = PassConfig.Origin,
-		-- SHOT: (aimX, aimY, power); PASS: (dirX, dirZ, power)
-		onShoot = nil :: ((a: number, b: number, power: number) -> ())?,
+		highBall = false, -- MOMENT: drags are crosses
+		action = "SHOT", -- MOMENT: what the current press is (SHOT | PASS | CROSS)
+		-- SHOT: (aimX, aimY, power); PASS: (dirX, dirZ, power); MOMENT adds the action
+		onShoot = nil :: ((a: number, b: number, power: number, action: string?) -> ())?,
 		guide = nil :: Guide?,
 		_activeInput = nil :: InputObject?,
 		_holdStartedAt = 0,
@@ -58,6 +67,28 @@ function InputController:setMode(mode: string, passOrigin: Vector3?)
 	self.passOrigin = passOrigin or PassConfig.Origin
 	self.target = nil
 	self.power = 0
+	self.action = if mode == "PASS" then "PASS" else "SHOT"
+end
+
+function InputController:setHighBall(on: boolean)
+	self.highBall = on
+end
+
+-- Charging a shot (SHOT mode, or a press on the goal in a moment).
+function InputController:isShooting(): boolean
+	return self.mode == "SHOT" or (self.mode == "MOMENT" and self.action == "SHOT")
+end
+
+function InputController:isPassing(): boolean
+	return self.mode == "PASS" or (self.mode == "MOMENT" and self.action ~= "SHOT")
+end
+
+function InputController:_range(): (number, number)
+	if self.mode == "MOMENT" and self.action == "CROSS" then
+		local c = MomentPhysics.Config
+		return c.CrossMinRange, c.CrossMaxRange
+	end
+	return PassConfig.Ball.MinRange, PassConfig.Ball.MaxRange
 end
 
 function InputController:setEnabled(enabled: boolean)
@@ -72,7 +103,7 @@ end
 
 -- Call every frame: advances the shot power meter while held.
 function InputController:update()
-	if not self.holding or self.mode ~= "SHOT" then
+	if not self.holding or not self:isShooting() then
 		return
 	end
 	local phase = ((os.clock() - self._holdStartedAt) / ShotConfig.Input.PowerCycleSeconds) % 1
@@ -104,6 +135,17 @@ local function screenToAim(position: Vector3): (number?, number?)
 	return ShotPhysics.goalPointToAim(point)
 end
 
+-- MOMENT: whether a press here means a shot (on or around the goal frame).
+local function inShotZone(position: Vector3): boolean
+	local ray = screenRay(position)
+	if not ray or ray.Direction.Z > -1e-4 then
+		return false
+	end
+	local point = ray.Origin + ray.Direction * (-ray.Origin.Z / ray.Direction.Z)
+	local goal = ShotConfig.Goal
+	return math.abs(point.X) <= goal.Width / 2 + SHOT_ZONE_MARGIN_X and point.Y >= -1 and point.Y <= goal.Height + SHOT_ZONE_MARGIN_Y
+end
+
 -- Projects a screen point onto the grass (Y = 0), limited to the longest pass.
 function InputController:_screenToGround(position: Vector3): Vector3?
 	local ray = screenRay(position)
@@ -113,7 +155,7 @@ function InputController:_screenToGround(position: Vector3): Vector3?
 	local point = ray.Origin + ray.Direction * (-ray.Origin.Y / ray.Direction.Y)
 	local origin = self.passOrigin
 	local delta = Vector3.new(point.X - origin.X, 0, point.Z - origin.Z)
-	local maxRange = PassConfig.Ball.MaxRange
+	local _, maxRange = self:_range()
 	if delta.Magnitude > maxRange then
 		delta = delta.Unit * maxRange
 	end
@@ -121,12 +163,13 @@ function InputController:_screenToGround(position: Vector3): Vector3?
 end
 
 function InputController:_aimAt(position: Vector3)
-	if self.mode == "PASS" then
+	if self:isPassing() then
 		local target = self:_screenToGround(position)
 		if target then
 			self.target = target
 			local origin = self.passOrigin
-			self.power = Vector3.new(target.X - origin.X, 0, target.Z - origin.Z).Magnitude / PassConfig.Ball.MaxRange
+			local _, maxRange = self:_range()
+			self.power = Vector3.new(target.X - origin.X, 0, target.Z - origin.Z).Magnitude / maxRange
 		end
 		return
 	end
@@ -159,6 +202,10 @@ function InputController:_onBegan(input: InputObject, gameProcessed: boolean)
 		self._activeInput = input
 		self._holdStartedAt = os.clock()
 		self.power = 0
+		if self.mode == "MOMENT" then
+			self.action = if inShotZone(input.Position) then "SHOT" elseif self.highBall then "CROSS" else "PASS"
+			self.target = nil
+		end
 		self:_aimAt(input.Position)
 	end
 end
@@ -193,11 +240,12 @@ function InputController:_onEnded(input: InputObject)
 	if not (self.enabled and self.onShoot) then
 		return
 	end
-	if self.mode == "PASS" then
+	if self:isPassing() then
 		local target = self.target
 		local origin = self.passOrigin
+		local minRange, maxRange = self:_range()
 		local delta = target and Vector3.new(target.X - origin.X, 0, target.Z - origin.Z)
-		if not delta or delta.Magnitude < PassConfig.Ball.MinRange then
+		if not delta or delta.Magnitude < minRange then
 			self.target, self.power = nil, 0 -- a tap or a tiny drag: no pass
 			return
 		end
@@ -210,10 +258,10 @@ function InputController:_onEnded(input: InputObject)
 			return
 		end
 		local dir = delta.Unit
-		self.onShoot(dir.X, dir.Z, math.clamp(delta.Magnitude / PassConfig.Ball.MaxRange, 0, 1))
+		self.onShoot(dir.X, dir.Z, math.clamp(delta.Magnitude / maxRange, 0, 1), if self.mode == "MOMENT" then self.action else nil)
 		return
 	end
-	self.onShoot(self.aimX, self.aimY, self.power)
+	self.onShoot(self.aimX, self.aimY, self.power, if self.mode == "MOMENT" then "SHOT" else nil)
 end
 
 return InputController

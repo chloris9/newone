@@ -18,10 +18,14 @@ local TutorialHint = require(script:WaitForChild("TutorialHint"))
 local PassVisuals = require(script:WaitForChild("PassVisuals"))
 local CareerMenu = require(script:WaitForChild("CareerMenu"))
 local MatchHud = require(script:WaitForChild("MatchHud"))
+local MomentVisuals = require(script:WaitForChild("MomentVisuals"))
+local Commentary = require(script:WaitForChild("Commentary"))
+local MomentPhysics = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("MomentPhysics"))
 
 local CARD_DELAY = 0.55 -- let the player see the ball hit the net before the card covers the goal
 local FOLLOW_UP_DELAY = 0.75 -- after a good pass: the receiver controls it, then the shot camera
 local MATCH_OUTCOME_TIME = 2.4 -- match: the commentator's line after your moment, before play goes on
+local GOAL_CELEBRATION_TIME = 2.5 -- match: the scorer's celebration before the studio comes back
 
 local Remotes = ReplicatedStorage:WaitForChild("Remotes", 10)
 if not Remotes then
@@ -65,6 +69,8 @@ local bestSpeed = 0 -- fastest goal in the current task attempt, for the complet
 local inTraining = false
 local inMatch = false
 local matchHud = MatchHud.new()
+local momentVisuals = MomentVisuals.new()
+local matchUi = Commentary.ui()
 local lastCompletedStage = nil -- stage of the last completed task (SHOT | PASS)
 
 -- choice: "RETRY" or "NEXT" from the completion menu, otherwise nil.
@@ -101,15 +107,25 @@ local function showProgress(info)
 end
 
 -- Switches the 3D scene: SHOT (shot drill), PASS (pass drill), FOLLOWUP (pass drill's players,
--- shot drill's camera and ball), nil (menus: both drills put away). Returns whether the camera moves.
+-- shot drill's camera and ball), MOMENT (match moment: its own players and camera, the shot
+-- drill's goal, keeper and shot replay), nil (menus: all put away). Returns whether the camera moves.
 local function setScene(scene: string?): boolean
 	if scene == currentScene then
 		return false
 	end
 	currentScene = scene
+	if scene ~= "MOMENT" then
+		momentVisuals:exit()
+		visuals:setCameraEnabled(true)
+	end
 	if scene == nil then
 		visuals:setActive(false)
 		passVisuals:exit()
+	elseif scene == "MOMENT" then
+		passVisuals:exit()
+		visuals:setActive(true)
+		visuals:setCameraEnabled(false)
+		momentVisuals:enter()
 	elseif scene == "PASS" then
 		visuals:setActive(false)
 		passVisuals:enter()
@@ -122,9 +138,26 @@ local function setScene(scene: string?): boolean
 	return true
 end
 
-input.onShoot = function(a, b, power)
+input.onShoot = function(a, b, power, action)
 	local episode = currentEpisode
 	if not episode then
+		return
+	end
+	if episode.kind == "MOMENT" then
+		if not momentVisuals:isDeciding() then
+			return
+		end
+		input:setEnabled(false)
+		hud:setPowerZone(nil)
+		visuals:updateAiming(false, 0, 0.5, 0, false)
+		momentVisuals:onReleased(action or "SHOT")
+		matchHud:setHighBallVisible(false)
+		matchHud:setPressure(nil)
+		hud:setTitle(if action == "SHOT" then "Flying" else "PassFlying")
+		if action == "SHOT" then
+			visuals:onShotReleased()
+		end
+		SubmitEpisodeInput:FireServer(episode.episodeId, a, b, power, momentVisuals:decisionTime(), action)
 		return
 	end
 	input:setEnabled(false)
@@ -155,6 +188,27 @@ EpisodeStarted.OnClientEvent:Connect(function(episode)
 	input:setEnabled(false)
 	local pass = episode.kind == "PASS"
 	local auto = episode.auto -- match: the teammate shoots after your pass, already resolved
+	if inMatch and auto then
+		-- The finish in the moment scene: a header is struck where he met the cross (the moment
+		-- camera stays); a ground finish gets the shot camera behind him.
+		local header = episode.header == true
+		momentVisuals:beginFollowUp(episode.receiver, episode.spot, header)
+		visuals:reset(episode.spot)
+		if not header then
+			visuals:setCameraEnabled(true)
+		end
+		hud:setVisible(true)
+		hud:hideCard()
+		hud:setPower(0)
+		task.delay(if header then 0.1 else 1.2, function()
+			if currentEpisode == episode then
+				momentVisuals:followUpKick()
+				visuals:onShotReleased()
+				handleResult(auto)
+			end
+		end)
+		return
+	end
 	local followUp = episode.mode == "FOLLOWUP" or auto ~= nil
 	local moved = setScene(if pass then "PASS" elseif followUp then "FOLLOWUP" else "SHOT")
 	if inMatch then
@@ -256,14 +310,27 @@ local function showOutcome(result)
 	end
 end
 
--- Match: the commentator's line for what just happened, the new score, then on with the match.
+-- Match: the commentator's line for what just happened (back in the studio), the new score, then
+-- on with the match.
 local function matchOutcome(result)
-	local pass = result.kind == "PASS"
 	local key
-	if pass then
+	if result.kind == "MOMENT" then
+		local detail = result.detail
+		if result.action == "TACKLE" then
+			key = "YOU_TACKLED"
+		elseif result.action == "SHOT" then
+			key = if result.outcome == "GOAL" then "YOU_GOAL" elseif result.outcome == "SAVE" then "YOU_SAVE" elseif result.outcome == "POST" then "YOU_POST" else "YOU_MISS"
+		else
+			key = if detail == "INTERCEPTED" then "PASS_FAIL" elseif detail == "CLEARED" then "CROSS_CLEARED" else "PASS_MISS"
+		end
+	elseif result.kind == "PASS" then
 		key = "PASS_FAIL"
 	elseif result.mode == "AUTO" then
-		key = if result.outcome == "GOAL" then "ASSIST_GOAL" elseif result.outcome == "SAVE" then "MATE_SAVE" else "MATE_MISS"
+		if result.header then
+			key = if result.outcome == "GOAL" then "HEADER_GOAL" elseif result.outcome == "SAVE" then "HEADER_SAVE" else "HEADER_MISS"
+		else
+			key = if result.outcome == "GOAL" then "ASSIST_GOAL" elseif result.outcome == "SAVE" then "MATE_SAVE" else "MATE_MISS"
+		end
 	else
 		key = if result.outcome == "GOAL" then "YOU_GOAL" elseif result.outcome == "SAVE" then "YOU_SAVE" elseif result.outcome == "POST" then "YOU_POST" else "YOU_MISS"
 	end
@@ -271,6 +338,9 @@ local function matchOutcome(result)
 	matchHud:setPlaying(false)
 	if result.score then
 		matchHud:setScore(result.score, true)
+	end
+	if result.state then
+		matchHud:setState(result.state)
 	end
 	matchHud:say(key, { n = result.number })
 	task.delay(MATCH_OUTCOME_TIME, function()
@@ -280,12 +350,100 @@ local function matchOutcome(result)
 	end)
 end
 
+-- Match moment result: the shot, the pass or cross, or the tackle, then the line in the studio.
+local function momentResult(result)
+	currentEpisode = nil
+	input:setEnabled(false)
+	visuals:updateAiming(false, 0, 0.5, 0, false)
+	momentVisuals:updateAiming(false)
+	matchHud:setPressure(nil)
+	matchHud:setHighBallVisible(false)
+	if result.action == "TACKLE" then
+		momentVisuals:tackle(result.tackler)
+		hud:setTitle("")
+		task.delay(1.1, function()
+			if inMatch and not currentEpisode then
+				matchOutcome(result)
+			end
+		end)
+	elseif result.action == "SHOT" then
+		momentVisuals:onShotPlayed()
+		visuals:playShot(result, function()
+			local goal = result.outcome == "GOAL"
+			if goal then
+				momentVisuals:celebrate("ME")
+			end
+			task.delay(if goal then GOAL_CELEBRATION_TIME else CARD_DELAY + 0.5, function()
+				if inMatch and not currentEpisode and not waitingForEpisode then
+					matchOutcome(result)
+				end
+			end)
+		end)
+	else
+		momentVisuals:playPass(result, function()
+			if result.followUp then
+				-- Received: no studio yet, the teammate finishes next.
+				hud:setTitle(matchHud:say(if result.action == "CROSS" then "CROSS_GOOD" else "PASS_GOOD", { n = result.number }))
+				waitingForEpisode = true
+				task.delay(if result.header then 0.05 else FOLLOW_UP_DELAY, function()
+					if inMatch and not currentEpisode then
+						MatchRequest:FireServer("AUTO")
+					end
+				end)
+				return
+			end
+			task.delay(0.9, function()
+				if inMatch and not currentEpisode then
+					matchOutcome(result)
+				end
+			end)
+		end)
+	end
+end
+
+-- The banner is done: onto the pitch. The decision clock (and the server's) starts after the intro.
+local function startMoment(episode)
+	if not inMatch or typeof(episode) ~= "table" or typeof(episode.layout) ~= "table" then
+		return
+	end
+	local layout = episode.layout
+	currentEpisode = episode
+	waitingForEpisode = false
+	input:setEnabled(false)
+	input:setHighBall(false)
+	setScene("MOMENT")
+	visuals:setCameraEnabled(false)
+	visuals:setSpot(MomentPhysics.shotSpot(layout))
+	hud:hideCard()
+	hud:setPower(0)
+	hud:setPowerZone(nil)
+	hud:setMode("SHOT", "MATCH", 1, "SHOT")
+	hud:setTitle("")
+	hud:setVisible(true)
+	matchHud:setPlaying(true)
+	matchHud:setHighBall(false)
+	matchHud:setHighBallVisible(false)
+	momentVisuals:begin(layout, function()
+		if currentEpisode ~= episode then
+			return
+		end
+		MatchRequest:FireServer("READY")
+		input:setMode("MOMENT", layout.carrier)
+		input:setEnabled(true)
+		matchHud:setHighBallVisible(true)
+	end)
+end
+
 function handleResult(result)
 	if result.rejected then
 		warn("[ShotClient] Server rejected the input:", result.reason)
 		if inMatch then
 			-- The moment is still open on the server: aim again.
 			if currentEpisode then
+				if currentEpisode.kind == "MOMENT" then
+					momentVisuals:resume()
+					matchHud:setHighBallVisible(true)
+				end
 				input:setEnabled(true)
 			end
 			return
@@ -298,6 +456,11 @@ function handleResult(result)
 	if not currentEpisode or result.episodeId ~= currentEpisode.episodeId then
 		return
 	end
+	if result.kind == "MOMENT" then
+		momentResult(result)
+		return
+	end
+	local episodeInfo = currentEpisode
 	currentEpisode = nil
 	local pass = result.kind == "PASS"
 	if not pass and result.mode == "TASK" and result.outcome == "GOAL" then
@@ -306,7 +469,11 @@ function handleResult(result)
 
 	local function onDecisive()
 		if (result.mode == "FOLLOWUP" or result.mode == "AUTO") and result.outcome == "GOAL" then
-			passVisuals:celebrateGoal()
+			if inMatch then
+				momentVisuals:celebrate(episodeInfo.receiver)
+			else
+				passVisuals:celebrateGoal()
+			end
 		end
 		if result.mode == "TASK" then
 			showProgress(result)
@@ -332,8 +499,8 @@ function handleResult(result)
 			return
 		end
 		hud:setTitle(if pass then "PassAfter" else "AfterShot")
-		-- A goal in a match: let the scorer's knee slide play before the commentary takes over.
-		local wait = if inMatch and result.mode == "AUTO" and result.outcome == "GOAL" then 2.2 else CARD_DELAY
+		-- A goal in a match: let the scorer's celebration play before the commentary takes over.
+		local wait = if inMatch and result.mode == "AUTO" and result.outcome == "GOAL" then GOAL_CELEBRATION_TIME elseif inMatch then CARD_DELAY + 0.5 else CARD_DELAY
 		task.delay(wait, function()
 			if not currentEpisode and not waitingForEpisode then
 				if inMatch then
@@ -371,8 +538,8 @@ menu.onStartTraining = function(career)
 	requestEpisode()
 end
 
--- Match: the simulated part is the scoreboard and the commentator over the stadium (shot camera);
--- the training HUD's power panel only shows during the player's own moments.
+-- Match: between your moments the commentator's studio fills the screen (MatchHud); the pitch
+-- (MomentVisuals over the shot drill's goal and keeper) only shows for your moments.
 menu.onStartMatch = function(career, header)
 	local home, away = CareerConfig.club(header.homeId), CareerConfig.club(header.awayId)
 	if not (home and away) then
@@ -380,22 +547,30 @@ menu.onStartMatch = function(career, header)
 		return
 	end
 	passVisuals:setPasser(career.number, CareerConfig.upper(career.lastName))
+	momentVisuals:setPlayer(career.number, CareerConfig.upper(career.lastName))
 	inMatch = true
 	currentEpisode = nil
 	waitingForEpisode = false
 	hud:hideCard()
 	hud:setTrainingPanels(false)
 	hud:setVisible(false)
-	setScene("SHOT")
-	visuals:reset()
-	matchHud:start(home, away, career.lastName)
+	setScene("MOMENT")
+	matchHud:start(home, away, career.lastName, career.number, { stamina = header.stamina or 100, effort = header.effort or 2, focus = header.focus or "ATTACK" })
 	MatchRequest:FireServer("NEXT")
 end
 
-matchHud.onChoice = function(choice)
+matchHud.onEffort = function(effort)
 	if inMatch then
-		MatchRequest:FireServer(choice)
+		MatchRequest:FireServer("EFFORT", effort)
 	end
+end
+matchHud.onFocus = function(focus)
+	if inMatch then
+		MatchRequest:FireServer("FOCUS", focus)
+	end
+end
+matchHud.onHighBall = function(on)
+	input:setHighBall(on)
 end
 
 local function leaveMatch()
@@ -416,7 +591,9 @@ MatchUpdate.OnClientEvent:Connect(function(update)
 		return
 	end
 	hud:setVisible(false)
-	matchHud:setPlaying(false)
+	if update.state then
+		matchHud:setState(update.state)
+	end
 	matchHud:playEvents(update.events or {}, function()
 		if not inMatch then
 			return
@@ -427,7 +604,12 @@ MatchUpdate.OnClientEvent:Connect(function(update)
 			end
 			matchHud:showResult(update.result, update.career)
 		elseif update.moment then
-			matchHud:showMoment(update.moment)
+			local moment = update.moment
+			matchHud:showMoment(moment, function()
+				startMoment(moment.episode)
+			end)
+		else
+			MatchRequest:FireServer("NEXT")
 		end
 	end)
 end)
@@ -471,8 +653,31 @@ RunService.RenderStepped:Connect(function(dt)
 	local pass = currentScene == "PASS"
 	visuals:update(dt) -- keeper (and the camera while the shot drill is active)
 	passVisuals:update(dt)
+	momentVisuals:update(dt)
 	input:update()
-	if input.enabled then
+	if currentScene == "MOMENT" then
+		-- Match moment: shot (goal crosshair + power) or pass / cross (line on the grass).
+		if input.enabled and not momentVisuals:isDeciding() then
+			input:setEnabled(false) -- tackled
+			visuals:updateAiming(false, 0, 0.5, 0, false)
+			momentVisuals:updateAiming(false)
+			matchHud:setHighBallVisible(false)
+		end
+		if input.enabled then
+			local shooting = input.holding and input:isShooting()
+			visuals:updateAiming(shooting, input.aimX, input.aimY, input.power, shooting)
+			momentVisuals:updateAiming(true, input.action, input.target, input.holding)
+			hud:setPower(if shooting then input.power elseif input.holding then math.clamp(input.power, 0, 1) else 0)
+			local title
+			if input.holding then
+				title = if shooting then matchUi.MomentHolding elseif input.action == "CROSS" then matchUi.MomentCrossHolding else matchUi.MomentPassHolding
+			else
+				title = if input.highBall then matchUi.MomentHigh else matchUi.MomentReady
+			end
+			hud:setTitle(title)
+		end
+		matchHud:setPressure(momentVisuals:pressure())
+	elseif input.enabled then
 		local guided = hint:isActive()
 		local demoPower = hint:update(dt, input.holding, input.power, hud.scale, input.target)
 		if pass then
@@ -489,7 +694,7 @@ RunService.RenderStepped:Connect(function(dt)
 		end
 	end
 	-- The keeper gets set (hop + lower stance) while the player charges a shot.
-	local holding = input.enabled and input.holding and not pass
+	local holding = input.enabled and input.holding and not pass and input:isShooting()
 	if holding ~= wasHolding then
 		wasHolding = holding
 		visuals:setCharging(holding)
