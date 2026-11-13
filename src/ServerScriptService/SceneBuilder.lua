@@ -48,10 +48,10 @@ local PITCH_BACK = -24 -- a stripe boundary lands on the goal line
 local PITCH_FRONT = 104
 
 -- Stand behind the goal (z is negative behind the goal line).
-local STAND_HALF_WIDTH = 105
+local STAND_HALF_WIDTH = 172 -- wide enough to fill the moments' overhead camera, not just the shot camera
 local STAND_FRONT_Z = Arena.BoardZ - 3 -- walkway between the boards and the stand
 local STAND_WALL_HEIGHT = 4.8
-local AISLES = { -56, -20, 20, 56 }
+local AISLES = { -135, -95, -56, -20, 20, 56, 95, 135 }
 local AISLE_WIDTH = 2.4
 local SEAT_SPACING = 1.65
 
@@ -59,13 +59,6 @@ local CROWD_SHIRTS = { VIOLET, VIOLET, VIOLET_BRIGHT, RED, RED, GOLD, CREAM, PIN
 local CROWD_SKIN = { rgb(240, 196, 150), rgb(214, 160, 112), rgb(160, 104, 66), rgb(104, 64, 40) }
 local WINDOW_COLOURS = { GOLD, GOLD, CREAM, rgb(255, 214, 140), PINK, VIOLET_BRIGHT }
 local BUILDING_COLOURS = { rgb(34, 16, 64), rgb(43, 18, 80), rgb(28, 14, 54), rgb(52, 24, 96) }
-
--- Horizontal half-width the shot camera sees at depth z on screens up to 2.25:1, so crowd
--- blocks are only spent where they can appear.
-local VIEW_SLOPE = math.tan(math.rad(CameraConfig.FieldOfView / 2)) * 2.25
-local function visibleHalfWidth(z: number): number
-	return (CameraConfig.Position.Z - z) * VIEW_SLOPE
-end
 
 local SceneBuilder = {}
 
@@ -429,7 +422,7 @@ local function buildBoards(scene: Instance)
 	local boards = folder("Boards", scene)
 	local height = Arena.BoardHeight
 	local width = 20
-	for index = -5, 5 do
+	for index = -8, 8 do
 		local board = makePart({
 			Name = "Board",
 			Size = Vector3.new(width, height, 1),
@@ -441,7 +434,7 @@ local function buildBoards(scene: Instance)
 	end
 	makePart({
 		Name = "TopStrip",
-		Size = Vector3.new(width * 11, 0.18, 0.9),
+		Size = Vector3.new(width * 17, 0.18, 0.9),
 		CFrame = CFrame.new(0, height + 0.09, Arena.BoardZ - 0.5),
 		Color = VIOLET_BRIGHT,
 		Material = Enum.Material.Neon,
@@ -496,7 +489,7 @@ local function buildTier(stand: Instance, crowd: Instance, rng: Random, frontZ: 
 		for _, x in AISLES do
 			makePart({ Name = "AisleStep", Size = Vector3.new(AISLE_WIDTH, 0.06, tread), CFrame = CFrame.new(x, top + 0.03, centreZ), Color = AISLE, Parent = stand })
 		end
-		local halfWidth = math.min(visibleHalfWidth(centreZ) + 4, STAND_HALF_WIDTH - 1)
+		local halfWidth = STAND_HALF_WIDTH - 1
 		local x = -halfWidth
 		while x <= halfWidth do
 			-- A few empty seats keep the crowd from reading as a solid wall.
@@ -541,11 +534,11 @@ local function buildStand(scene: Instance, rng: Random)
 		Color = NAVY,
 		Parent = stand,
 	})
-	for index = -2, 2 do
+	for index = -4, 4 do
 		local ribbon = makePart({
 			Name = "Ribbon",
-			Size = Vector3.new(42, ribbonHeight, 0.8),
-			CFrame = CFrame.new(index * 42, ribbonBottom + ribbonHeight / 2, lowerBack - 0.4),
+			Size = Vector3.new(38, ribbonHeight, 0.8),
+			CFrame = CFrame.new(index * 38, ribbonBottom + ribbonHeight / 2, lowerBack - 0.4),
 			Color = NAVY,
 			Parent = stand,
 		})
@@ -585,7 +578,7 @@ local function buildStand(scene: Instance, rng: Random)
 	})
 	neonStrip(stand, "FasciaGlowLow", roofY - 0.25, roofFront + 0.1, VIOLET_BRIGHT)
 	neonStrip(stand, "FasciaGlowHigh", roofY + 0.85, roofFront + 0.1, PINK)
-	for x = -80, 80, 10 do
+	for x = -160, 160, 10 do
 		makePart({
 			Name = "RoofLamp",
 			Size = Vector3.new(2.4, 0.2, 1),
@@ -815,8 +808,8 @@ end
 local function buildPlayLights(scene: Instance)
 	local rig = folder("PlayLights", scene)
 	local lamps = {
-		{ from = Vector3.new(-30, 42, 30), to = Vector3.new(0, 4, 0), brightness = 3, angle = 70 },
-		{ from = Vector3.new(30, 42, 30), to = Vector3.new(0, 4, 0), brightness = 3, angle = 70 },
+		{ from = Vector3.new(-30, 42, 30), to = Vector3.new(0, 4, 0), brightness = 2.3, angle = 70 },
+		{ from = Vector3.new(30, 42, 30), to = Vector3.new(0, 4, 0), brightness = 2.3, angle = 70 },
 		{ from = Vector3.new(0, 38, 62), to = Vector3.new(0, 0, ShotConfig.ShotDistance), brightness = 2, angle = 60 },
 	}
 	for _, lamp in lamps do
@@ -873,7 +866,7 @@ local function setupLighting()
 	local bloom = ensureChild(Lighting, "BloomEffect", "Bloom")
 	bloom.Intensity = 0.9
 	bloom.Size = 30
-	bloom.Threshold = 1.45
+	bloom.Threshold = 1.75 -- floodlit skin stays skin; only neon and lamps glow
 
 	local grading = ensureChild(Lighting, "ColorCorrectionEffect", "ColorCorrection")
 	grading.Saturation = 0.2
