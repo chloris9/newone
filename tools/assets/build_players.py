@@ -6,7 +6,10 @@ Usage (needs Pillow, numpy, opencv-python-headless):  python3 tools/assets/build
 
 Sheet layout (1254x1254, same template for every sheet):
   head strip  y~245-420: [back-left][right side][front][left side][back-right]; the back image is
-              back-right + back-left (the strip wraps). The tile row at its top is the hair cap.
+              back-right + back-left (the strip wraps). The blocky tile row at its top is repainted
+              as hair (it sits under the hair volume).
+  hair renders above and beside the head cross (see hair.py): cut out with an alpha matte for the
+              faces of FigureBuilder's transparent hair volume.
   shirt band  y~535-855: [arm side][arm front][torso front][arm front][torso side][arm back]
               [torso back][arm back][arm side]. Front/back arm panels are left/right as seen from the
               camera, so the character's Right arm is the panel on the left in the front view.
@@ -24,6 +27,7 @@ from PIL import Image, ImageDraw
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import hair as HAIR  # noqa: E402
 import packed_image as P  # noqa: E402
 
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
@@ -35,7 +39,7 @@ TMP = "/tmp/tex"
 # Same key order as the previous generated modules.
 KEYS = [
     "HeadFront", "HeadBack", "HeadLeft", "HeadRight",
-    "HairFront", "HairBack", "HairLeft", "HairRight",
+    "HairFront", "HairBack", "HairLeft", "HairRight", "HairTop", "HairCap",
     "UpperTorsoFront", "LowerTorsoFront", "UpperTorsoBack", "LowerTorsoBack",
     "UpperTorsoSide", "LowerTorsoSide",
     "RightUpperArmFront", "RightLowerArmFront", "RightHandFront",
@@ -54,7 +58,6 @@ SHEETS = {
     "main": dict(
         file="main_player_sheet.png",
         head_bottom=414,
-        fringe=(465, 790),
         head=dict(bL=(267, 376), rs=(383, 528), f=(535, 716), ls=(725, 870), bR=(879, 989)),
         torso=dict(f=(277, 506), b=(751, 976), s=(604, 652)),
         arm=dict(fr=(184, 269), fl=(514, 594), bl=(662, 742), br=(982, 1069), wl=(48, 174), wr=(1078, 1205),
@@ -64,7 +67,6 @@ SHEETS = {
     "rival9": dict(
         file="rival9_sheet.png",
         head_bottom=417,
-        fringe=(490, 765),
         head=dict(bL=(267, 380), rs=(387, 523), f=(530, 720), ls=(729, 867), bR=(874, 986)),
         torso=dict(f=(277, 500), b=(752, 976), s=(604, 650)),
         arm=dict(fr=(188, 262), fl=(511, 590), bl=(663, 741), br=(987, 1066), wl=(49, 171), wr=(1082, 1205),
@@ -74,7 +76,6 @@ SHEETS = {
     "teammate28": dict(
         file="teammate28_sheet.png",
         head_bottom=408,
-        fringe=(505, 705),
         head=dict(bL=(270, 377), rs=(384, 522), f=(529, 682), ls=(689, 820), bR=(827, 983)),
         torso=dict(f=(274, 500), b=(749, 977), s=(603, 653)),
         arm=dict(fr=(181, 264), fl=(510, 592), bl=(663, 741), br=(987, 1073), wl=(49, 172), wr=(1082, 1205),
@@ -84,7 +85,6 @@ SHEETS = {
     "teammate7": dict(
         file="teammate7_sheet.png",
         head_bottom=414,
-        fringe=(465, 765),
         head=dict(bL=(268, 377), rs=(384, 517), f=(524, 685), ls=(692, 825), bR=(832, 985)),
         torso=dict(f=(279, 502), b=(752, 976), s=(603, 653)),
         arm=dict(fr=(184, 270), fl=(511, 593), bl=(662, 743), br=(985, 1071), wl=(49, 173), wr=(1080, 1205),
@@ -101,7 +101,9 @@ LEG_SIDE_R, LEG_SIDE_L = (82, 187), (1067, 1172)
 LEG_TOP, LEG_BOOT = 872, 1154
 HIPS = (874, 943)
 
-PPU_HEAD, PPU_BODY, PPU_HAIR = (int(v) for v in os.environ.get("NFS_PPU", "92,76,64").split(","))
+PPU_HEAD, PPU_BODY, PPU_HAIR = (int(v) for v in os.environ.get("NFS_PPU", "92,76,120").split(","))
+# Bottom of the head strip's tile row (sheet y); everything above it is repainted as hair.
+HAIR_BAND_BOTTOM = 300
 
 # Number / print areas painted out on the sheets that get text prints. Regions are in sheet pixels.
 PAINT_OUT = {
@@ -132,7 +134,9 @@ FACE = {
     "Torso": (2.0, 1.4), "TorsoSide": (1.0, 1.4), "Hips": (2.0, 0.6), "HipsSide": (1.0, 0.6),
     "UpperArm": (0.9, 1.0), "LowerArm": (0.85, 0.75), "Hand": (0.95, 0.75),
     "UpperLeg": (0.98, 1.05), "LowerLeg": (0.9, 0.6),
-    "Hair": (1.5, 0.34), "HairSide": (1.42, 0.34),
+    # FigureBuilder's hair volume (front/back, sides), the crown plate inside it (top) and the cap.
+    "HairFront": (1.72, 0.92), "HairBack": (1.72, 0.92), "HairLeft": (1.5, 0.92), "HairRight": (1.5, 0.92),
+    "HairTop": (1.5, 1.4), "HairCap": (0.4, 0.4),
 }
 
 
@@ -158,7 +162,6 @@ def layout(c):
     h, t, a, lg = c["head"], c["torso"], c["arm"], c["leg"]
     hb = c["head_bottom"]
     top = 248
-    hair_rows = (252, 288)
     cuts = {}
 
     def put(key, pieces, face, ppu):
@@ -168,13 +171,7 @@ def layout(c):
     put("HeadBack", [rect(h["bR"], top, hb), rect(h["bL"], top, hb)], "Head", PPU_HEAD)
     put("HeadLeft", [rect(h["ls"], top, hb)], "HeadSide", PPU_HEAD)
     put("HeadRight", [rect(h["rs"], top, hb)], "HeadSide", PPU_HEAD)
-    # Hair cap: the tile row, avoiding the fringe that overhangs it beside the face.
-    lo, hi = c["fringe"]
-    clean_r, clean_l = (h["rs"][0], lo), (hi, h["ls"][1])
-    put("HairFront", [rect(h["bL"], *hair_rows), rect(h["bR"], *hair_rows)], "Hair", PPU_HAIR)
-    put("HairBack", [rect(h["bR"], *hair_rows), rect(h["bL"], *hair_rows)], "Hair", PPU_HAIR)
-    put("HairLeft", [rect(clean_l, *hair_rows), rect(h["bR"], *hair_rows)], "HairSide", PPU_HAIR)
-    put("HairRight", [rect(clean_r, *hair_rows), rect(h["bL"], *hair_rows)], "HairSide", PPU_HAIR)
+    # The hair images come from hair.hair_set (cut-out renders, not panel rectangles).
 
     ty0, ty1 = 551, 849
     put("UpperTorsoFront", [rect(t["f"], ty0, ty1)], "Torso", PPU_BODY)
@@ -308,17 +305,42 @@ def main():
                     d.rectangle(p, outline=(255, 0, 255))
             im.save(f"{TMP}/overlay_{k}.png")
 
+    hair_sizes = {k: px(k, PPU_HAIR) for k in FACE if k.startswith("Hair")}
+    hair_cache = {}  # head sheet -> {key: (image, packed)}; Rival9 and RivalPlain share one
+
+    def head_and_hair(sheet_key):
+        if sheet_key not in hair_cache:
+            sheet = sheets[sheet_key]
+            hair_images, mattes = HAIR.hair_set(sheet, sheet_key, hair_sizes)
+            strip = HAIR.band_strip(mattes["back"])
+            c = SHEETS[sheet_key]
+            band_frac = (HAIR_BAND_BOTTOM - 248) / (c["head_bottom"] - 248)
+            done = {}
+            for key in ("HeadFront", "HeadBack", "HeadLeft", "HeadRight"):
+                img = cut_image(sheet, cuts[sheet_key][key])
+                img = HAIR.paint_hair_band(img, round(img.height * band_frac), strip)
+                done[key] = (img, P.encode_pil(img, COLORS, dither=False))
+            for key, img in hair_images.items():
+                if img.mode == "RGBA":
+                    idx, palette = HAIR.quantise_rgba(img)
+                    done[key] = (img, P.encode(img.width, img.height, idx, palette))
+                else:
+                    done[key] = (img, P.encode_pil(img, COLORS, dither=False))
+            hair_cache[sheet_key] = done
+        return hair_cache[sheet_key]
+
     report = {}
     for module, (head_sheet, kit_sheet, remove_numbers, header) in MODULES.items():
         kit_src = cleaned[kit_sheet] if remove_numbers else sheets[kit_sheet]
         images = {}
         total = 0
+        own = head_and_hair(head_sheet)
         for key in KEYS:
-            if key.startswith(("Head", "Hair")):
-                img = cut_image(sheets[head_sheet], cuts[head_sheet][key])
+            if key in own:
+                img, images[key] = own[key]
             else:
                 img = cut_image(kit_src, cuts[kit_sheet][key])
-            images[key] = P.encode_pil(img, COLORS, dither=False)
+                images[key] = P.encode_pil(img, COLORS, dither=False)
             total += img.width * img.height
             if debug:
                 img.save(f"{TMP}/new/{module}_{key}.png")
