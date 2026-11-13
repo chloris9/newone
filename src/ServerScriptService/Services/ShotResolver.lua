@@ -15,7 +15,9 @@ export type ShotStats = { shooting: number, keeperSkill: number }
 -- in a comfortable range, there is no scatter and the keeper dives too late.
 -- keeperDelay: extra keeper reaction time in seconds (easier keeper for the training task).
 -- start: ball position (default: the penalty-area spot); a shot after a pass starts at the receiver.
-export type ShotOptions = { guided: { aimX: number, aimY: number }?, keeperDelay: number?, start: Vector3?, scatterScale: number? }
+-- Match moments: aimPoint (the point on the goal plane, may be wide or high) and spin (from where
+-- the ball was struck) replace the ones derived from aimX / aimY.
+export type ShotOptions = { guided: { aimX: number, aimY: number }?, keeperDelay: number?, start: Vector3?, scatterScale: number?, aimPoint: Vector3?, spin: Vector3? }
 export type ShotResult = {
 	input: ShotInput, -- the input actually used (guided shots may move the aim)
 	outcome: string, -- "GOAL" | "SAVE" | "POST" | "MISS" (series history / scoring)
@@ -84,7 +86,7 @@ function ShotResolver.resolve(input: ShotInput, stats: ShotStats, rng: Random, o
 		offsetX, offsetY = 0, 0
 	end
 
-	local intended = ShotPhysics.aimToGoalPoint(input.aimX, input.aimY)
+	local intended = (options and options.aimPoint) or ShotPhysics.aimToGoalPoint(input.aimX, input.aimY)
 	local target = Vector3.new(intended.X + offsetX, math.max(ShotConfig.Ball.Radius, intended.Y + offsetY), 0)
 
 	-- 2. Spin and the launch velocity that flies (with drag and curl) to the target.
@@ -93,7 +95,8 @@ function ShotResolver.resolve(input: ShotInput, stats: ShotStats, rng: Random, o
 	if guided then
 		jitterX, jitterY = 0, 0
 	end
-	local spin = ShotPhysics.spinFor(input.aimX, input.power, jitterX, jitterY)
+	local base = options and options.spin
+	local spin = if base then base + Vector3.new(jitterX, jitterY, 0) * 0.5 else ShotPhysics.spinFor(input.aimX, input.power, jitterX, jitterY)
 	local start = (options and options.start) or ShotPhysics.ballSpot()
 	local velocity = ShotPhysics.solveLaunch(start, target, input.power, spin)
 
