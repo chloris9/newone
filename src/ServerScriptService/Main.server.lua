@@ -36,7 +36,7 @@ for _, name in { "ShotConfig", "ShotPhysics", "PassConfig", "PassPhysics", "Figu
 	end
 end
 
-local REMOTE_NAMES = { "RequestEpisode", "EpisodeStarted", "SubmitEpisodeInput", "EpisodeResult", "MatchRequest", "MatchUpdate" }
+local REMOTE_NAMES = { "RequestEpisode", "EpisodeStarted", "SubmitEpisodeInput", "EpisodeResult", "MatchRequest", "MatchUpdate", "MomentInput" }
 
 local remotesFolder = ReplicatedStorage:FindFirstChild("Remotes")
 if not remotesFolder then
