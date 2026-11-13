@@ -1,16 +1,16 @@
--- 3D side of a match moment (MomentPhysics): you, teammates #7 and #28, two or three defenders,
--- the ball, ground markers and the aiming line. Everything is local to this client and replays
--- what the server decided.
---   begin(layout)  intro: #28 plays the ball to you (RECEIVE) or you carry it forward (ON_BALL),
---                  then slow motion: pressers close in until the tackle time (onReady fires when
---                  the decision clock starts; the server starts its own clock then).
---   playPass / tackle / beginFollowUp / followUpKick / celebrate: the rest of the moment.
--- The shot itself (ball flight, keeper, net) is ShotVisuals'; this scene owns the camera until
--- a teammate's finish, which uses the shot camera.
+-- 3D side of a match moment (MomentPhysics), everything local to this client:
+--   studio()         the broadcast camera over the blurred stadium while the commentator talks;
+--   begin(layout)    a step of your moment: the intro (#28 passes to you, you carry it, or the
+--                    one-two comes back), then the decision in slow motion: drag an arrow from the
+--                    ball (onAim), then the strike screen: a close-up of the ball, tap where to hit
+--                    it (onStrike). Open teammates show a ball bubble; pressers close in.
+--   playPass / tackle / handOffShot / celebrate replay what the server decided.
+-- Shots themselves (flight, keeper, net) are ShotVisuals'; handOffShot lets its camera take over.
 
 local Lighting = game:GetService("Lighting")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local ShotConfig = require(Shared:WaitForChild("ShotConfig"))
@@ -22,18 +22,23 @@ local Config = MomentPhysics.Config
 local BALL_RADIUS = ShotConfig.Ball.Radius
 local SCALE = ShotConfig.Goalkeeper.ModelScale
 local SLOW = Config.SlowMo
-local LINE_DOTS = 26
-local CAMERA_BLEND = 0.9
-local CAMERA_FOV = 50
-local HEADER_SLOWMO = 0.12 -- the cross hangs at the header until the finish arrives
 local MAX_DEFENDERS = 3
-local DEFENDER_NUMBERS = { 4, 5, 3 }
+local DASHES = 16
+local HEAD_BARS = 8
+local CAMERA_BLEND = 0.8
+local STRIKE_BLEND = 0.35
+local DECIDE_FOV = 48
+local STRIKE_FOV = 38
+local STRIKE_DISTANCE = 5.4 -- camera behind the ball on the strike screen
+local MATE_TARGET_RADIUS = 6 -- the arrow "points at" a teammate this close to its end
 
 local rgb = Color3.fromRGB
 local WHITE = Color3.new(1, 1, 1)
 local GOLD = rgb(255, 191, 31)
+local LIME = rgb(150, 240, 60)
 local LILAC = rgb(190, 168, 255)
 local RED = rgb(255, 45, 85)
+local ARROW_RED = rgb(255, 70, 40)
 local SKIN = rgb(214, 132, 82)
 local HAIR = rgb(52, 32, 26)
 -- Kits are painted on from the character sheets; these colours only show if images are unavailable.
@@ -41,7 +46,6 @@ local NAVY = rgb(26, 36, 110)
 local TEAM_KIT = { skin = SKIN, shirt = NAVY, shorts = NAVY, socks = NAVY, boots = rgb(236, 232, 244), hair = HAIR }
 local BLACK = rgb(24, 18, 26)
 local OPPONENT_KIT = { skin = SKIN, shirt = BLACK, shorts = BLACK, socks = BLACK, boots = rgb(236, 232, 244), hair = HAIR, print = rgb(245, 245, 245) }
--- Numberless rival kit (numbers drawn as text) if it was generated, else the #9 sheet.
 local Images = Shared:WaitForChild("Images")
 local DEFENDER_SHEET = if Images:FindFirstChild("RivalPlain") then "RivalPlain" else "Rival9"
 
@@ -75,7 +79,7 @@ local function groundCircle(parent: Instance, name: string, radius: number, colo
 	local gui = create("SurfaceGui", { Face = Enum.NormalId.Top, LightInfluence = 0, SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud, PixelsPerStud = 24, Parent = part })
 	local circle = create("Frame", { AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.new(1, -8, 1, -8), BackgroundColor3 = color, BackgroundTransparency = fill, Parent = gui })
 	create("UICorner", { CornerRadius = UDim.new(1, 0), Parent = circle })
-	local stroke = create("UIStroke", { Color = color, Thickness = 4, Parent = circle })
+	local stroke = create("UIStroke", { Color = color, Thickness = 5, Parent = circle })
 	return { part = part, frame = circle, stroke = stroke }
 end
 
@@ -105,18 +109,38 @@ local function flat(v: Vector3): Vector3
 	return Vector3.new(v.X, 0, v.Z)
 end
 
+local function unit(v: Vector3, fallback: Vector3): Vector3
+	return if v.Magnitude > 1e-4 then v.Unit else fallback
+end
+
 local function smooth(t: number): number
 	t = math.clamp(t, 0, 1)
 	return t * t * (3 - 2 * t)
 end
 
+-- Where you stand with the ball on your right foot.
+local function standFor(ball: Vector3, facing: Vector3): Vector3
+	return flat(ball) - facing * 1.5 - facing:Cross(Vector3.yAxis) * 0.7
+end
+
+---------------------------------------------------------------- construction
+
 function MomentVisuals.new()
 	local self = setmetatable({}, MomentVisuals)
 	self.active = false
-	self.token = 0
 	self.phase = "IDLE"
+	self.token = 0
+	self.cameraMode = "NONE" -- STUDIO | PITCH | STRIKE | FOCUS | NONE (someone else has it)
 	self.ballRotation = CFrame.identity
 	self.ballPosition = Vector3.new(0, -50, 0)
+	-- Callbacks (ShotClient)
+	self.onReady = nil :: ((number) -> ())?
+	self.onAim = nil :: ((any) -> ())? -- aim info while dragging, nil when not
+	self.onStrikeStart = nil :: (() -> ())?
+	self.onStrikeTimer = nil :: ((number) -> ())?
+	self.onReticle = nil :: ((Vector2?) -> ())?
+	self.onStrike = nil :: ((number, number, number, number, number, number) -> ())?
+	self.onTimer = nil :: ((number?) -> ())?
 
 	local folder = create("Folder", { Name = "MomentVisuals" })
 	self.folder = folder
@@ -140,37 +164,91 @@ function MomentVisuals.new()
 			end
 		end
 		model.Parent = folder
-		return FigureAnimator.new(model, rootHeight, SCALE)
+		local animator = FigureAnimator.new(model, rootHeight, SCALE)
+		animator.hideParts = {}
+		for _, d in model:GetDescendants() do
+			if d:IsA("BasePart") or d:IsA("Decal") then
+				table.insert(animator.hideParts, d)
+			elseif d:IsA("SurfaceGui") then
+				table.insert(animator.hideParts, d)
+			end
+		end
+		return animator
 	end
 	self.me = figure("You", TEAM_KIT, "PlayerMain", 10)
 	self.mates = { figure("Mate7", TEAM_KIT, "Teammate7"), figure("Mate28", TEAM_KIT, "Teammate28") }
 	self.defenders = {}
 	for i = 1, MAX_DEFENDERS do
-		self.defenders[i] = figure("Defender" .. i, OPPONENT_KIT, DEFENDER_SHEET, if DEFENDER_SHEET == "RivalPlain" then DEFENDER_NUMBERS[i] else nil)
+		self.defenders[i] = figure("Defender" .. i, OPPONENT_KIT, DEFENDER_SHEET, if DEFENDER_SHEET == "RivalPlain" then 3 + i else nil)
 	end
 
+	-- Ground markers.
+	self.meRing = groundCircle(folder, "YouRing", 2.6, LIME, 0.75)
 	self.mateRings = {}
 	for i = 1, 2 do
-		self.mateRings[i] = groundCircle(folder, "MateRing" .. i, 3.2, LILAC, 0.85)
+		self.mateRings[i] = groundCircle(folder, "MateRing" .. i, 3, LILAC, 0.85)
 	end
 	self.dangerRings = {}
 	for i = 1, MAX_DEFENDERS do
-		self.dangerRings[i] = groundCircle(folder, "Danger" .. i, Config.TackleReach, RED, 0.75)
-	end
-	self.targetRing = groundCircle(folder, "Target", 1.8, GOLD, 0.6)
-	self.dots = {}
-	for i = 1, LINE_DOTS do
-		self.dots[i] = makePart({ Name = "LineDot", Shape = Enum.PartType.Ball, Size = Vector3.one * 0.55, Color = GOLD, Material = Enum.Material.Neon, Transparency = 1, Parent = folder })
+		self.dangerRings[i] = groundCircle(folder, "Danger" .. i, Config.TackleReach + 0.6, RED, 0.8)
 	end
 
-	-- Slow motion look: colours drain a little while you decide.
-	self.grade = create("ColorCorrectionEffect", { Name = "MomentSlowMo", Enabled = false, Saturation = 0, Contrast = 0, TintColor = WHITE, Parent = Lighting })
+	-- The arrow: a dashed shaft and a solid head, flat on the grass.
+	self.dashes = {}
+	for i = 1, DASHES do
+		self.dashes[i] = makePart({ Name = "Dash", Size = Vector3.new(1.1, 0.12, 2), Color = ARROW_RED, Material = Enum.Material.Neon, Transparency = 1, Parent = folder })
+	end
+	self.headBars = {}
+	for i = 1, HEAD_BARS do
+		self.headBars[i] = makePart({ Name = "Head", Size = Vector3.new(1, 0.12, 0.7), Color = ARROW_RED, Material = Enum.Material.Neon, Transparency = 1, Parent = folder })
+	end
+
+	-- Ball bubbles over teammates who want it.
+	self.bubbles = {}
+	for i, mate in self.mates do
+		local head = mate.model:FindFirstChild("Head")
+		local gui = create("BillboardGui", { Name = "Bubble", Adornee = head, Size = UDim2.fromOffset(46, 52), StudsOffset = Vector3.new(0, 2.6, 0), AlwaysOnTop = true, LightInfluence = 0, Enabled = false, Parent = folder })
+		local bubble = create("Frame", { Size = UDim2.fromOffset(46, 42), BackgroundColor3 = WHITE, BorderSizePixel = 0, Parent = gui })
+		create("UICorner", { CornerRadius = UDim.new(0, 10), Parent = bubble })
+		create("UIStroke", { Color = rgb(18, 6, 31), Thickness = 2.5, Parent = bubble })
+		create("TextLabel", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = "⚽", TextScaled = true, Parent = bubble })
+		local tail = create("Frame", { AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromOffset(16, 43), Size = UDim2.fromOffset(12, 12), Rotation = 45, BackgroundColor3 = WHITE, BorderSizePixel = 0, ZIndex = 0, Parent = gui })
+		create("UIStroke", { Color = rgb(18, 6, 31), Thickness = 2.5, Parent = tail })
+		self.bubbles[i] = gui
+	end
+
+	-- Slow motion and the studio look.
+	self.grade = create("ColorCorrectionEffect", { Name = "MomentGrade", Enabled = true, Saturation = 0, Contrast = 0, TintColor = WHITE, Parent = Lighting })
+	self.blur = create("BlurEffect", { Name = "StudioBlur", Enabled = false, Size = 0, Parent = Lighting })
+
+	UserInputService.InputBegan:Connect(function(input, processed)
+		self:_onInputBegan(input, processed)
+	end)
+	UserInputService.InputChanged:Connect(function(input)
+		self:_onInputChanged(input)
+	end)
+	UserInputService.InputEnded:Connect(function(input)
+		self:_onInputEnded(input)
+	end)
 	return self
 end
 
--- Your number and surname on your shirt.
 function MomentVisuals:setPlayer(number: number, surname: string)
 	FigureBuilder.setPrints(self.me.model, number, surname)
+end
+
+local function setHidden(animator, hidden: boolean)
+	if animator.hidden == hidden then
+		return
+	end
+	animator.hidden = hidden
+	for _, part in animator.hideParts do
+		if part:IsA("SurfaceGui") then
+			part.Enabled = not hidden
+		else
+			part.LocalTransparencyModifier = if hidden then 1 else 0
+		end
+	end
 end
 
 function MomentVisuals:_setBall(position: Vector3)
@@ -181,14 +259,12 @@ function MomentVisuals:_setBall(position: Vector3)
 	self.ballPosition = position
 end
 
--- Ball to a new spot, rolling (or spinning in the air) on the way.
 function MomentVisuals:_moveBall(position: Vector3)
 	local moved = position - self.ballPosition
 	if moved.Magnitude > 1e-4 and moved.Magnitude < 20 then
 		local ground = flat(moved)
 		if ground.Magnitude > 1e-4 then
-			local axis = Vector3.yAxis:Cross(ground.Unit)
-			self.ballRotation = CFrame.fromAxisAngle(axis, ground.Magnitude / BALL_RADIUS) * self.ballRotation
+			self.ballRotation = CFrame.fromAxisAngle(Vector3.yAxis:Cross(ground.Unit), ground.Magnitude / BALL_RADIUS) * self.ballRotation
 		end
 	end
 	self:_setBall(position)
@@ -202,200 +278,420 @@ local function placeRing(ring, position: Vector3)
 	ring.part.CFrame = CFrame.new(position.X, 0.06, position.Z)
 end
 
-function MomentVisuals:_setSlowMo(on: boolean)
-	self.slowmo = on
-	local grade = self.grade
-	grade.Enabled = true
-	TweenService:Create(grade, TweenInfo.new(0.35), {
-		Saturation = if on then -0.35 else 0,
-		Contrast = if on then 0.12 else 0,
-		TintColor = if on then rgb(225, 232, 255) else WHITE,
+function MomentVisuals:_grade(slow: boolean)
+	TweenService:Create(self.grade, TweenInfo.new(0.35), {
+		Saturation = if slow then -0.3 else 0,
+		Contrast = if slow then 0.1 else 0,
+		TintColor = if slow then rgb(225, 232, 255) else WHITE,
 	}):Play()
 end
 
--- Behind you, high enough to see the goal, your teammates and the defenders.
-local function cameraFor(layout): (Vector3, Vector3)
-	local c = layout.carrier
-	local position = c - layout.toGoal * 30 + Vector3.new(-c.X * 0.25, 24, 0)
-	local look = c:Lerp(Vector3.new(0, 0, 8), 0.55)
-	return position, look
+function MomentVisuals:_blendCamera(mode: string, duration: number?)
+	local camera = workspace.CurrentCamera
+	self.cameraMode = mode
+	self.blendFrom, self.blendFov, self.blendT = camera.CFrame, camera.FieldOfView, 0
+	self.blendTime = duration or CAMERA_BLEND
 end
 
--- Where you stand with the ball on your right foot.
-local function standFor(ball: Vector3, facing: Vector3): Vector3
-	return flat(ball) - facing * 1.5 - facing:Cross(Vector3.yAxis) * 0.7
-end
+---------------------------------------------------------------- studio and enter / exit
 
-function MomentVisuals:enter()
-	self.active = true
-	self.folder.Parent = workspace
+-- Between moments: a slow broadcast shot over the stadium behind the panels.
+function MomentVisuals:studio()
+	self.token += 1
+	self.phase = "STUDIO"
+	self.active = false
+	self.folder.Parent = nil
+	self:_clearAim()
+	self:_grade(false)
+	self.blur.Enabled = true
+	TweenService:Create(self.blur, TweenInfo.new(0.5), { Size = 14 }):Play()
+	self.studioClock = 0
+	self:_blendCamera("STUDIO", 0.6)
 end
 
 function MomentVisuals:exit()
-	self.active = false
-	self.phase = "IDLE"
 	self.token += 1
+	self.phase = "IDLE"
+	self.active = false
 	self.folder.Parent = nil
-	if self.slowmo then
-		self:_setSlowMo(false)
-	end
+	self.cameraMode = "NONE"
+	self.blur.Enabled = false
+	self.blur.Size = 0
+	self:_grade(false)
+	self:_clearAim()
 end
 
--- New moment. Returns the intro length; onReady fires when the decision clock starts.
-function MomentVisuals:begin(layout, onReady: (() -> ())?): number
-	self:enter()
+---------------------------------------------------------------- a step of the moment
+
+-- New step: everyone to their marks, the intro, then the decision (onReady fires with the step).
+function MomentVisuals:begin(layout)
+	local previous = self.layout
 	self.token += 1
 	self.layout = layout
+	self.active = true
+	self.folder.Parent = workspace
+	self.blur.Enabled = false
+	self.blur.Size = 0
 	self.phase = "INTRO"
 	self.clock = 0
 	self.decision = 0
-	self.onReady = onReady
 	self.replay = nil
-	self.followUp = nil
 	self.tackled = false
-	self.released = false
 	self.aim = nil
-	self.aimTarget = nil
-	self.introKicked, self.introTrapped = false, false
-	self.smoothLook = nil
-	self.timeScale = 1
-	self.ballRotation = CFrame.identity
-	local toGoal = layout.toGoal
+	self.dragging = nil
 	self.intro = MomentPhysics.intro(layout)
-
-	local camera = workspace.CurrentCamera
-	self.blendFrom, self.blendFov, self.blendT = camera.CFrame, camera.FieldOfView, 0
-	self.cameraOn = true
-	self.cameraLook = nil
-
+	self.ballRotation = CFrame.identity
+	for _, figure in self:_figures() do
+		setHidden(figure, false)
+	end
+	local toGoal = layout.toGoal
 	local carrier = layout.carrier
-	if layout.kind == "RECEIVE" then
-		self.me:place(standFor(carrier, toGoal), flat((layout.passerFrom :: Vector3) - carrier))
-		self.introBallFrom = layout.passerFrom + flat(carrier - layout.passerFrom).Unit * 1.6
+
+	-- Where everyone starts the intro.
+	self.introFrom = {}
+	if layout.kind == "ONE_TWO" and previous then
+		-- You run on from where you were; defenders recover to their new spots.
+		self.introFrom.me = self.me.position
+		self.introBallFrom = layout.passerFrom
+		for i, defender in self.defenders do
+			self.introFrom[defender] = defender.position
+		end
+		self.me:play(nil)
 	else
-		local from = carrier - toGoal * 7
-		self.me:place(standFor(from, toGoal), toGoal)
-		self.introBallFrom = from
+		if layout.kind == "RECEIVE" then
+			self.me:place(standFor(carrier, toGoal), flat(layout.passerFrom - carrier))
+			self.introBallFrom = layout.passerFrom + unit(flat(carrier - layout.passerFrom), toGoal) * 1.6
+		else
+			local from = carrier - toGoal * 7
+			self.me:place(standFor(from, toGoal), toGoal)
+			self.introBallFrom = from
+		end
+		self.introFrom.me = self.me.position
+		for i, defender in self.defenders do
+			local spec = layout.defenders[i]
+			if spec then
+				defender:place(spec.from, flat(carrier - spec.from))
+			end
+			self.introFrom[defender] = spec and spec.from
+		end
 	end
-	self:_setBall(self.introBallFrom + Vector3.new(0, BALL_RADIUS, 0))
 	self.me:play(nil)
+	self:_setBall(flat(self.introBallFrom) + Vector3.new(0, BALL_RADIUS, 0))
 	for i, mate in self.mates do
-		local at = MomentPhysics.mateAt(layout, i, 0)
+		local spec = layout.teammates[i]
 		mate:play(nil)
-		mate:place(at, flat(carrier - at))
-		self.mateRings[i].part.Parent = self.folder
-		placeRing(self.mateRings[i], at)
+		if layout.kind ~= "ONE_TWO" or i ~= layout.passer then
+			if layout.kind ~= "ONE_TWO" then
+				mate:place(spec.from, flat(carrier - spec.from))
+			end
+		end
+		self.introFrom[mate] = mate.position
 	end
-	if layout.kind == "RECEIVE" then
-		-- #28 stands behind the ball, about to play it.
-		local passer = self.mates[2]
-		local dir = flat(carrier - layout.passerFrom).Unit
-		passer:place(flat(self.introBallFrom) - dir * 1.5 - dir:Cross(Vector3.yAxis) * 0.7, dir)
+	if layout.passer and layout.passerFrom then
+		-- The passer stands behind the ball, about to play it.
+		local passer = self.mates[layout.passer]
+		local dir = unit(flat(carrier - layout.passerFrom), toGoal)
+		local spot = flat(self.introBallFrom) - dir * 1.5 - dir:Cross(Vector3.yAxis) * 0.7
+		if layout.kind ~= "ONE_TWO" then
+			passer:place(spot, dir)
+		end
+		self.introFrom[passer] = passer.position
 	end
 	for i, defender in self.defenders do
 		local spec = layout.defenders[i]
 		defender.model.Parent = if spec then self.folder else nil
-		self.dangerRings[i].part.Parent = nil
-		if spec then
-			local at = MomentPhysics.defenderAt(layout, i, 0)
-			defender:play(nil)
-			defender:place(at, flat(carrier - at))
+		if spec and spec.number and DEFENDER_SHEET == "RivalPlain" then
+			FigureBuilder.setPrints(defender.model, spec.number, "")
 		end
+		defender:play(nil)
 	end
-	self:updateAiming(false)
+	for i, ring in self.dangerRings do
+		ring.part.Parent = nil
+	end
+	for i, ring in self.mateRings do
+		ring.part.Parent = self.folder
+	end
+	self.meRing.part.Parent = self.folder
+	self:_clearAim()
+	self:_grade(false)
+	if self.cameraMode ~= "PITCH" then
+		self:_blendCamera("PITCH")
+	end
+	self.lookAt = nil
 	return self.intro
 end
 
--- Decision seconds (sent with the input; the server checks it against the tackle).
-function MomentVisuals:decisionTime(): number
-	return self.decision
-end
-
--- 1 = all the time in the world, 0 = tackled; nil outside the decision.
-function MomentVisuals:pressure(): number?
-	if self.phase ~= "DECIDE" or not self.layout then
-		return nil
+function MomentVisuals:_figures()
+	local list = { self.me, self.mates[1], self.mates[2] }
+	for _, defender in self.defenders do
+		table.insert(list, defender)
 	end
-	return 1 - self.decision / self.layout.tackleTime
+	return list
 end
 
 function MomentVisuals:isDeciding(): boolean
 	return self.phase == "DECIDE"
 end
 
--- Aiming line for a pass (dots on the grass) or a cross (an arc in the air).
-function MomentVisuals:updateAiming(enabled: boolean, action: string?, target: Vector3?, holding: boolean?)
+-- 1 = plenty of time, 0 = the tackle; nil outside the decision.
+function MomentVisuals:timeLeft(): number?
+	if self.phase ~= "DECIDE" or not self.layout then
+		return nil
+	end
+	return 1 - self.decision / self.layout.tackleTime
+end
+
+---------------------------------------------------------------- the arrow
+
+local function screenToGround(position: Vector3): Vector3?
+	local camera = workspace.CurrentCamera
+	local ray = camera:ScreenPointToRay(position.X, position.Y)
+	if ray.Direction.Y > -1e-4 then
+		return nil
+	end
+	return ray.Origin + ray.Direction * (-ray.Origin.Y / ray.Direction.Y)
+end
+
+function MomentVisuals:_clearAim()
+	for _, part in self.dashes do
+		part.Transparency = 1
+	end
+	for _, part in self.headBars do
+		part.Transparency = 1
+	end
+	self.aimInfo = nil
+	if self.onAim then
+		self.onAim(nil)
+	end
+end
+
+-- What the arrow ending at `target` means: SHOT, PASS to a teammate, PASS into space, or SHORT.
+function MomentVisuals:_aimInfo(target: Vector3)
 	local layout = self.layout
-	local show = enabled and holding and target ~= nil and layout ~= nil and action ~= "SHOT"
-	self.aimTarget = if show then target else nil
-	self.targetRing.part.Parent = if show then self.folder else nil
-	for _, dot in self.dots do
-		dot.Transparency = 1
+	local carrier = layout.carrier
+	local length = flat(target - carrier).Magnitude
+	if length < Config.MinArrow then
+		return { kind = "SHORT", target = target, length = length }
 	end
-	if not show then
-		if enabled and layout and action == "SHOT" and holding then
-			self.aim = flat(-layout.carrier).Unit
+	if MomentPhysics.classify(layout, target) == "SHOT" then
+		return { kind = "SHOT", target = target, length = length }
+	end
+	local best, bestDistance = nil, MATE_TARGET_RADIUS
+	for i in self.mates do
+		local at = MomentPhysics.mateAt(layout, i, self.decision)
+		local d = flat(at - target).Magnitude
+		if d < bestDistance then
+			best, bestDistance = i, d
 		end
-		return
 	end
-	local origin = layout.carrier
-	local delta = flat((target :: Vector3) - origin)
+	return { kind = if best then "MATE" else "SPACE", mate = best, number = best and layout.teammates[best].number, open = best and MomentPhysics.isOpen(layout, best, self.decision), target = target, length = length }
+end
+
+function MomentVisuals:_drawArrow(info)
+	local carrier = self.layout.carrier
+	local delta = flat(info.target - carrier)
 	local length = delta.Magnitude
 	if length < 1e-3 then
+		self:_clearAim()
 		return
 	end
 	local dir = delta / length
-	self.aim = dir
-	placeRing(self.targetRing, origin + delta)
-	local high = action == "CROSS"
-	local minRange = if high then Config.CrossMinRange else 8
-	local tooShort = length < minRange
-	local color = if tooShort then LILAC elseif high then rgb(120, 220, 255) else GOLD
-	local count = math.clamp(math.floor(length / 2), 3, LINE_DOTS)
-	for i, dot in self.dots do
+	local color = if info.kind == "SHOT" then GOLD elseif info.kind == "MATE" then (if info.open then LIME else rgb(255, 160, 40)) elseif info.kind == "SHORT" then LILAC else ARROW_RED
+	local headLength = math.min(5, length * 0.45)
+	local shaft = length - headLength
+	local start = carrier + dir * 1.4
+	local count = math.clamp(math.floor(shaft / 3.1), 0, DASHES)
+	for i, part in self.dashes do
 		if i <= count then
-			local u = i / (count + 1)
-			local p
-			if high then
-				local flightTime = MomentPhysics.crossFlight(length)
-				p = MomentPhysics.crossBallAt(origin, dir, length, u * flightTime)
-			else
-				p = origin + dir * (length * u) + Vector3.new(0, 0.2, 0)
-			end
-			dot.CFrame = CFrame.new(p)
-			dot.Color = color
-			dot.Transparency = 0.1 + 0.5 * u
+			local center = start + dir * ((i - 0.5) * (shaft - 1.4) / count)
+			part.CFrame = CFrame.lookAt(Vector3.new(center.X, 0.14, center.Z), Vector3.new(center.X, 0.14, center.Z) + dir)
+			part.Size = Vector3.new(1.1, 0.12, math.min(2, (shaft - 1.4) / count * 0.62))
+			part.Color = color
+			part.Transparency = 0.1
+		else
+			part.Transparency = 1
 		end
 	end
-	self.targetRing.stroke.Color = color
-	self.targetRing.frame.BackgroundColor3 = color
+	-- The head: bars across the arrow, wide at the back and narrow at the tip.
+	local headWidth = math.min(5, 1.6 + length * 0.12)
+	for i, part in self.headBars do
+		local k = (i - 0.5) / HEAD_BARS
+		local center = carrier + dir * (shaft + headLength * k)
+		part.CFrame = CFrame.lookAt(Vector3.new(center.X, 0.15, center.Z), Vector3.new(center.X, 0.15, center.Z) + dir)
+		part.Size = Vector3.new(math.max(0.3, headWidth * (1 - k)), 0.12, headLength / HEAD_BARS + 0.05)
+		part.Color = color
+		part.Transparency = 0.05
+	end
+	self.aimInfo = info
+	if self.onAim then
+		self.onAim(info)
+	end
 end
 
--- You played it: time back to normal, the kick, and everyone waits for the server.
-function MomentVisuals:onReleased(action: string)
-	if self.phase ~= "DECIDE" then
+---------------------------------------------------------------- input
+
+local function isPress(input: InputObject): boolean
+	return input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch
+end
+
+function MomentVisuals:_onInputBegan(input: InputObject, processed: boolean)
+	if processed or not isPress(input) then
 		return
 	end
-	self.released = true
-	self.phase = "RELEASED"
-	self:_setSlowMo(false)
-	self:updateAiming(false)
-	local layout = self.layout
-	local facing = self.aim or flat(-layout.carrier).Unit
-	if action == "SHOT" then
-		facing = flat(-layout.carrier).Unit
+	if self.phase == "DECIDE" and not self.dragging then
+		self.dragging = input
+		local target = screenToGround(input.Position)
+		if target then
+			self:_drawArrow(self:_aimInfo(target))
+		end
+	elseif self.phase == "STRIKE" then
+		self:_tryStrike(input.Position)
 	end
-	self.me.facing = facing
+end
+
+function MomentVisuals:_onInputChanged(input: InputObject)
+	if self.phase == "DECIDE" and self.dragging then
+		local moving = input.UserInputType == Enum.UserInputType.MouseMovement or (input.UserInputType == Enum.UserInputType.Touch and input == self.dragging)
+		if moving then
+			local target = screenToGround(input.Position)
+			if target then
+				local carrier = self.layout.carrier
+				local delta = flat(target - carrier)
+				if delta.Magnitude > Config.MaxArrow then
+					target = carrier + delta.Unit * Config.MaxArrow
+				end
+				self:_drawArrow(self:_aimInfo(target))
+			end
+		end
+	elseif self.phase == "STRIKE" then
+		if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+			local hit = self:_ballHit(input.Position)
+			if self.onReticle then
+				self.onReticle(if hit then Vector2.new(input.Position.X, input.Position.Y) else nil)
+			end
+		end
+	end
+end
+
+function MomentVisuals:_onInputEnded(input: InputObject)
+	if self.phase ~= "DECIDE" or not self.dragging then
+		return
+	end
+	local active = self.dragging
+	local isMouse = input.UserInputType == Enum.UserInputType.MouseButton1 and active.UserInputType == Enum.UserInputType.MouseButton1
+	if not (isMouse or input == active) then
+		return
+	end
+	self.dragging = nil
+	local info = self.aimInfo
+	if not info or info.kind == "SHORT" then
+		self:_clearAim()
+		return
+	end
+	self:_startStrike(info)
+end
+
+---------------------------------------------------------------- the strike screen
+
+function MomentVisuals:_startStrike(info)
+	self.phase = "STRIKE"
+	self.aimTime = self.decision
+	self.strikeInfo = info
+	self.strikeClock = 0
+	local carrier = self.layout.carrier
+	local dir = unit(flat(info.target - carrier), self.layout.toGoal)
+	self.strikeDir = dir
+	-- The ball fills the middle of the screen; you (behind it) are hidden.
+	local ball = carrier + Vector3.new(0, BALL_RADIUS, 0)
+	self:_setBall(ball)
+	self.ballRotation = CFrame.identity
+	self.strikeCamera = CFrame.lookAt(ball - dir * STRIKE_DISTANCE + Vector3.new(0, 0.9, 0), ball + Vector3.new(0, 0.15, 0))
+	setHidden(self.me, true)
+	for _, figure in self:_figures() do
+		-- Anyone standing between the camera and the ball goes too.
+		local rel = flat(figure.position - (ball - dir * STRIKE_DISTANCE))
+		if rel:Dot(dir) < STRIKE_DISTANCE + 0.5 and rel:Dot(dir) > -1 and (rel - dir * rel:Dot(dir)).Magnitude < 2.2 then
+			setHidden(figure, true)
+		end
+	end
+	self:_blendCamera("STRIKE", STRIKE_BLEND)
+	if self.onStrikeStart then
+		self.onStrikeStart()
+	end
+end
+
+-- Screen point -> where on the ball (x right, y up, -1..1 as seen by the camera), or nil if it
+-- missed the ball.
+function MomentVisuals:_ballHit(position: Vector3): (number?, number?)
+	if self.cameraMode ~= "STRIKE" then
+		return nil, nil
+	end
+	local camera = workspace.CurrentCamera
+	local ray = camera:ScreenPointToRay(position.X, position.Y)
+	local center = self.ballPosition
+	local oc = ray.Origin - center
+	local b = oc:Dot(ray.Direction)
+	local c = oc:Dot(oc) - BALL_RADIUS * BALL_RADIUS * 1.08
+	local disc = b * b - c
+	if disc < 0 then
+		return nil, nil
+	end
+	local t = -b - math.sqrt(disc)
+	local point = ray.Origin + ray.Direction * t
+	local rel = camera.CFrame:VectorToObjectSpace(point - center) / BALL_RADIUS
+	return math.clamp(rel.X, -1, 1), math.clamp(rel.Y, -1, 1)
+end
+
+function MomentVisuals:_tryStrike(position: Vector3)
+	local hitX, hitY = self:_ballHit(position)
+	if not hitX then
+		return
+	end
+	self:_strike(hitX, hitY :: number)
+end
+
+function MomentVisuals:_strike(hitX: number, hitY: number)
+	if self.phase ~= "STRIKE" then
+		return
+	end
+	self.phase = "STRUCK"
+	local info = self.strikeInfo
+	local dir = self.strikeDir
+	if self.onReticle then
+		self.onReticle(nil)
+	end
+	-- Your foot comes through: back to the pitch view, you kick, the ball waits for the result.
+	setHidden(self.me, false)
+	for _, figure in self:_figures() do
+		setHidden(figure, false)
+	end
+	self.me.facing = dir
 	self.me:play("KICK")
+	self:_grade(false)
+	self:_clearAim()
 	for _, ring in self.dangerRings do
 		ring.part.Parent = nil
 	end
+	for _, b in self.bubbles do
+		b.Enabled = false
+	end
+	if info.kind ~= "SHOT" then
+		self:_blendCamera("PITCH", 0.5)
+	end
+	if self.onStrike then
+		self.onStrike(dir.X, dir.Z, info.length, hitX, hitY, self.aimTime)
+	end
 end
 
--- The shot's replay (ShotVisuals) takes the ball.
-function MomentVisuals:onShotPlayed()
-	self.phase = "SHOT"
-	self:hideBall()
+---------------------------------------------------------------- results
+
+-- The server turned the input down: back to the decision, clock still running.
+function MomentVisuals:resume()
+	if self.phase == "STRUCK" then
+		self.phase = "DECIDE"
+		self:_grade(true)
+		self:_blendCamera("PITCH", 0.4)
+	end
 end
 
 -- Too slow: the presser takes the ball. Safe to call twice (local clock, then the server).
@@ -406,28 +702,37 @@ function MomentVisuals:tackle(tackler: number?)
 	self.tackled = true
 	self.phase = "TACKLE"
 	self.clock = 0
-	self:_setSlowMo(false)
-	self:updateAiming(false)
+	self.dragging = nil
+	self:_grade(false)
+	self:_clearAim()
+	if self.cameraMode ~= "PITCH" then
+		self:_blendCamera("PITCH", 0.4)
+	end
+	setHidden(self.me, false)
 	local index = tackler or self.layout.tackler
-	local defender = self.defenders[index]
+	local defender = self.defenders[index] or self.defenders[1]
 	self.tackleBy = defender
 	defender:play("LUNGE")
 	self.me:play("STUMBLE")
-	local side = flat(defender.position - self.layout.carrier)
-	self.tackleBallTo = flat(self.layout.carrier) + (if side.Magnitude > 1e-3 then side.Unit else Vector3.xAxis) * 4 + self.layout.toGoal:Cross(Vector3.yAxis) * 2
+	local carrier = flat(self.layout.carrier)
+	local side = flat(defender.position - carrier)
+	self.tackleBallTo = carrier + unit(side, Vector3.xAxis) * 4 + self.layout.toGoal:Cross(Vector3.yAxis) * 2
 	for _, ring in self.dangerRings do
 		ring.part.Parent = nil
 	end
+	for _, b in self.bubbles do
+		b.Enabled = false
+	end
 end
 
--- Replays the server's pass or cross. onDecisive runs when the result is clear on screen (a
--- received cross: as the header is about to happen, which then waits in slow motion).
+-- Replays the server's pass (ground or lofted). onDecisive runs when it is clear who has it.
 function MomentVisuals:playPass(result, onDecisive: () -> ())
 	self.phase = "REPLAY"
 	self.replay = { token = self.token, result = result, t = 0, onDecisive = onDecisive, decided = false, reacted = false }
 	for _, ring in self.mateRings do
 		ring.part.Parent = nil
 	end
+	self.meRing.part.Parent = nil
 end
 
 function MomentVisuals:_updateReplay(dt: number)
@@ -435,12 +740,11 @@ function MomentVisuals:_updateReplay(dt: number)
 	local result = replay.result
 	local step = result.sampleStep
 	local headerHold = result.detail == "GOOD" and result.header
-	if headerHold and replay.t >= result.eventTime - 0.35 then
-		dt *= HEADER_SLOWMO
+	if headerHold and replay.t >= result.eventTime - 0.3 then
+		dt *= 0.25 -- the cross hangs at the header for a moment
 	end
 	replay.t += dt
 	local t = replay.t
-
 	self:_moveBall(trackAt(result.ball, step, t))
 	local ball = self.ballPosition
 	for i, defender in self.defenders do
@@ -459,168 +763,235 @@ function MomentVisuals:_updateReplay(dt: number)
 	end
 	self.me:moveTo(self.me.position, flat(ball - self.me.position), dt)
 
-	local lead = if headerHold or (result.detail == "CLEARED") then 0.35 else 0.12
+	local lead = if headerHold or result.detail == "CLEARED" then 0.35 else 0.12
 	if not replay.reacted and t >= result.eventTime - lead then
 		replay.reacted = true
-		local detail = result.detail
 		local receiver = result.receiver and self.mates[result.receiver]
 		local interceptor = result.interceptor and self.defenders[result.interceptor]
-		if detail == "GOOD" and receiver then
+		if result.detail == "GOOD" and receiver then
 			receiver:play(if result.header then "HEADER" else "TRAP")
 		elseif interceptor then
-			interceptor:play(if detail == "CLEARED" then "HEADER" else "LUNGE")
-		elseif detail == "TOO_HARD" and receiver then
+			interceptor:play(if result.detail == "CLEARED" then "HEADER" else "LUNGE")
+		elseif result.detail == "TOO_HARD" and receiver then
 			receiver:play("LUNGE")
 		end
 	end
-	local decideAt = if headerHold then result.eventTime - 0.3 else result.eventTime
-	if not replay.decided and t >= decideAt then
+	if not replay.decided and t >= result.eventTime then
 		replay.decided = true
-		if result.detail == "INTERCEPTED" or result.detail == "CLEARED" then
+		if result.interceptor then
 			task.delay(0.6, function()
-				if self.replay == replay and result.interceptor then
+				if self.replay == replay then
 					self.defenders[result.interceptor]:play("CHEER")
 				end
 			end)
 		end
 		replay.onDecisive()
 	end
-	-- Camera drifts after the ball.
-	self.cameraLook = ball
+	self.lookAt = ball
 end
 
--- The teammate's finish after your pass or cross: he lines up (a header is struck where he met
--- the cross), the shot camera takes over for a ground shot.
-function MomentVisuals:beginFollowUp(receiver: number, spot: Vector3, header: boolean)
-	local mate = self.mates[receiver]
-	if not (self.active and mate and self.layout) then
-		return
-	end
+-- A shot (yours, or a teammate's finish): ShotVisuals flies the ball and its camera takes over.
+-- shooter: "ME" or a teammate index.
+function MomentVisuals:handOffShot(shooter: any, spot: Vector3, header: boolean?)
+	self.phase = "SHOT"
 	self.replay = nil
-	self.phase = "FOLLOWUP"
-	local toGoal = flat(-spot)
-	toGoal = if toGoal.Magnitude > 1e-3 then toGoal.Unit else Vector3.new(0, 0, -1)
-	self.followUp = { receiver = receiver, spot = spot, header = header, toGoal = toGoal, stand = flat(spot) - toGoal * 1.3 - toGoal:Cross(Vector3.yAxis) * 0.8 }
-	self:hideBall() -- ShotVisuals' ball takes over
+	self:hideBall()
+	self.cameraMode = "NONE"
+	local figure = if shooter == "ME" then self.me else self.mates[shooter]
+	if figure and shooter ~= "ME" then
+		local toGoal = unit(flat(-spot), Vector3.new(0, 0, -1))
+		figure:place(if header then flat(spot) - toGoal * 0.4 else standFor(spot, toGoal), toGoal)
+		figure:play(if header then "HEADER" else "KICK")
+	end
 	for _, ring in self.mateRings do
 		ring.part.Parent = nil
 	end
-	if header then
-		mate:place(flat(spot) - toGoal * 0.4, toGoal)
-		self.cameraOn = true
-		self.cameraLook = Vector3.new(0, 3, 0)
-	else
-		self.cameraOn = false -- ShotVisuals' shot camera
+	self.meRing.part.Parent = nil
+end
+
+-- A blocked shot: the defender who got in the way throws himself at it.
+function MomentVisuals:block(defender: number?)
+	local d = defender and self.defenders[defender]
+	if d then
+		d:play("LUNGE")
 	end
 end
 
-function MomentVisuals:followUpKick()
-	local fu = self.followUp
-	if fu then
-		fu.kicked = true
-		self.mates[fu.receiver]:play(if fu.header then "HEADER" else "KICK")
-	end
-end
-
--- who: "ME" or a teammate index. The scorer celebrates (random), the others cheer.
+-- The scorer celebrates (random), the others cheer; the camera comes in close.
 function MomentVisuals:celebrate(who: any)
 	local scorer = if who == "ME" then self.me else self.mates[who]
 	if not scorer then
 		return
 	end
 	local token = self.token
-	task.delay(0.3, function()
-		if self.active and self.token == token then
-			-- Towards the crowd on his side, half facing the camera.
-			local side = if scorer.position.X >= 0 then 1 else -1
-			scorer.facing = (Vector3.new(side, 0, 0) + Vector3.new(0, 0, 1) * 0.6).Unit
-			scorer:celebrate()
-		end
-	end)
+	local side = if scorer.position.X >= 0 then 1 else -1
+	scorer.facing = unit(Vector3.new(side, 0, 0.6), Vector3.new(0, 0, 1))
+	scorer:celebrate()
 	for _, figure in { self.me, self.mates[1], self.mates[2] } do
 		if figure ~= scorer then
 			figure:play("CHEER")
 		end
 	end
+	self.focus = scorer
+	task.delay(0.35, function()
+		if self.token == token then
+			self:_blendCamera("FOCUS", 0.7)
+		end
+	end)
 end
 
-local function slowMove(animator, position: Vector3, facing: Vector3, dt: number)
-	-- Real run cycle played slowly: moved by dt, animated by dt * SLOW.
-	animator:moveTo(position, facing, dt * SLOW)
+---------------------------------------------------------------- per frame
+
+local function decideCamera(layout): (Vector3, Vector3)
+	-- High behind you, the goal at the top of the screen (the reference's top-down view).
+	local c = layout.carrier
+	local look = Vector3.new(c.X * 0.45, 0, c.Z * 0.48)
+	local position = look + Vector3.new(c.X * 0.08, 30 + c.Z * 0.62, 18 + c.Z * 0.45)
+	return position, look
+end
+
+function MomentVisuals:_updateCamera(dt: number)
+	local mode = self.cameraMode
+	if mode == "NONE" then
+		return
+	end
+	local camera = workspace.CurrentCamera
+	camera.CameraType = Enum.CameraType.Scriptable
+	local target, fov
+	if mode == "STUDIO" then
+		self.studioClock = (self.studioClock or 0) + dt
+		local swing = math.sin(self.studioClock * 0.08)
+		local position = Vector3.new(swing * 30, 34, 96)
+		target, fov = CFrame.lookAt(position, Vector3.new(swing * 10, 4, 8)), 50
+	elseif mode == "STRIKE" then
+		target, fov = self.strikeCamera, STRIKE_FOV
+	elseif mode == "FOCUS" and self.focus then
+		local f = self.focus.model:GetPivot().Position
+		local from = Vector3.new(f.X * 0.85, 6.5, f.Z + 15)
+		target, fov = CFrame.lookAt(from, f + Vector3.new(0, 1.2, 0)), 40
+	elseif self.layout then
+		local position, look = decideCamera(self.layout)
+		if self.lookAt then
+			-- Follow the ball a little during a pass.
+			local shift = flat(self.lookAt - look) * 0.45
+			position += shift
+			look += shift
+		end
+		self.smoothPosition = if self.smoothPosition then self.smoothPosition:Lerp(position, math.min(1, dt * 3)) else position
+		self.smoothLook = if self.smoothLook then self.smoothLook:Lerp(look, math.min(1, dt * 3)) else look
+		target, fov = CFrame.lookAt(self.smoothPosition, self.smoothLook), DECIDE_FOV
+	else
+		return
+	end
+	if self.blendT < 1 then
+		self.blendT = math.min(1, self.blendT + dt / self.blendTime)
+		local k = smooth(self.blendT)
+		camera.CFrame = self.blendFrom:Lerp(target, k)
+		camera.FieldOfView = self.blendFov + (fov - self.blendFov) * k
+	else
+		camera.CFrame = target
+		camera.FieldOfView = fov
+	end
 end
 
 function MomentVisuals:update(dt: number)
+	self:_updateCamera(dt)
 	if not self.active or not self.layout then
 		return
 	end
 	local layout = self.layout
 	local carrier = layout.carrier
 	local toGoal = layout.toGoal
-	local slowFigures = {}
+	local slow = {}
 
 	if self.phase == "INTRO" then
 		self.clock += dt
 		local t = self.clock
+		local intro = self.intro
 		local stand = standFor(carrier, toGoal)
-		if layout.kind == "RECEIVE" then
-			local passer = self.mates[2]
-			local kickAt, arriveAt = 0.3, self.intro - 0.55
+		if layout.passer then
+			-- A pass to you: kicked at 0.3 s, at your feet just before the end.
+			local passer = self.mates[layout.passer]
+			local kickAt, arriveAt = 0.3, intro - 0.45
 			if t >= kickAt and not self.introKicked then
 				self.introKicked = true
 				passer:play("KICK")
 			end
-			if t < kickAt + 0.1 then
-				self:_setBall(self.introBallFrom + Vector3.new(0, BALL_RADIUS, 0))
+			if t < kickAt + 0.08 then
+				self:_setBall(flat(self.introBallFrom) + Vector3.new(0, BALL_RADIUS, 0))
 			else
-				local k = math.clamp((t - kickAt - 0.1) / (arriveAt - kickAt - 0.1), 0, 1)
-				local eased = 1 - (1 - k) * (1 - k)
-				self:_moveBall(flat(self.introBallFrom):Lerp(flat(carrier), eased) + Vector3.new(0, BALL_RADIUS, 0))
+				local k = math.clamp((t - kickAt - 0.08) / (arriveAt - kickAt - 0.08), 0, 1)
+				self:_moveBall(flat(self.introBallFrom):Lerp(flat(carrier), 1 - (1 - k) * (1 - k)) + Vector3.new(0, BALL_RADIUS, 0))
 			end
 			if t >= arriveAt - 0.12 and not self.introTrapped then
 				self.introTrapped = true
 				self.me:play("TRAP")
 			end
-			local ball = self.ballPosition
-			self.me:moveTo(stand, if t < arriveAt then flat(ball - stand) else toGoal, dt)
-			passer:moveTo(passer.position, flat(ball - passer.position), dt)
+			if layout.kind == "ONE_TWO" then
+				-- You sprint on to meet it.
+				local k = smooth(t / arriveAt)
+				self.me:moveTo(self.introFrom.me:Lerp(stand, k), toGoal, dt)
+			else
+				self.me:moveTo(stand, if t < arriveAt then flat(self.ballPosition - stand) else toGoal, dt)
+			end
+			passer:moveTo(passer.position, flat(self.ballPosition - passer.position), dt)
 		else
 			-- A few touches forward with the ball.
-			local k = smooth(t / (self.intro - 0.15))
-			local from = flat(self.introBallFrom)
-			local ballAt = from:Lerp(flat(carrier), k)
-			local touch = math.abs(math.sin(t * 9)) * 0.6
-			self:_moveBall(ballAt + toGoal * touch + Vector3.new(0, BALL_RADIUS, 0))
+			local k = smooth(t / (intro - 0.1))
+			local ballAt = flat(self.introBallFrom):Lerp(flat(carrier), k)
+			self:_moveBall(ballAt + toGoal * math.abs(math.sin(t * 9)) * 0.5 + Vector3.new(0, BALL_RADIUS, 0))
 			self.me:moveTo(standFor(ballAt, toGoal), toGoal, dt)
 		end
 		for i, defender in self.defenders do
-			if layout.defenders[i] then
-				defender:moveTo(defender.position, flat(self.ballPosition - defender.position), dt)
+			local spec = layout.defenders[i]
+			if spec then
+				local from = self.introFrom[defender] or spec.from
+				defender:moveTo(from:Lerp(spec.from, smooth(t / intro)), flat(self.ballPosition - defender.position), dt)
 			end
 		end
-		self.mates[1]:moveTo(self.mates[1].position, flat(self.ballPosition - self.mates[1].position), dt)
-		if t >= self.intro then
+		for i, mate in self.mates do
+			if i ~= layout.passer then
+				local from = self.introFrom[mate] or mate.position
+				local spec = layout.teammates[i]
+				mate:moveTo(from:Lerp(spec.from, smooth(t / intro)), flat(self.ballPosition - mate.position), dt)
+			end
+		end
+		if t >= intro then
 			self.introKicked, self.introTrapped = false, false
 			self.phase = "DECIDE"
 			self.decision = 0
-			self.aim = toGoal
 			self:_setBall(carrier + Vector3.new(0, BALL_RADIUS, 0))
-			self:_setSlowMo(true)
+			self:_grade(true)
 			for i, ring in self.dangerRings do
 				local spec = layout.defenders[i]
 				ring.part.Parent = if spec and spec.role == "PRESS" then self.folder else nil
 			end
 			if self.onReady then
-				self.onReady()
+				self.onReady(layout.step)
 			end
 		end
-	elseif self.phase == "DECIDE" then
-		self.decision += dt
+	elseif self.phase == "DECIDE" or self.phase == "STRIKE" then
+		if self.phase == "DECIDE" then
+			self.decision += dt
+		else
+			-- The strike screen has its own clock; the world holds still.
+			self.strikeClock += dt
+			local left = 1 - self.strikeClock / Config.StrikeTime
+			if self.onStrikeTimer then
+				self.onStrikeTimer(left)
+			end
+			if left <= 0 then
+				-- Rushed: a scuffed hit somewhere on the ball.
+				local angle = math.random() * math.pi * 2
+				self:_strike(math.cos(angle) * 0.85, math.sin(angle) * 0.85)
+			end
+		end
 		local t = self.decision
 		for i, defender in self.defenders do
 			if layout.defenders[i] then
 				local at = MomentPhysics.defenderAt(layout, i, t)
-				slowMove(defender, at, flat(carrier - at), dt)
-				slowFigures[defender] = true
+				defender:moveTo(at, flat(carrier - at), dt * SLOW)
+				slow[defender] = true
 				placeRing(self.dangerRings[i], at)
 			end
 		end
@@ -628,86 +999,45 @@ function MomentVisuals:update(dt: number)
 			local at = MomentPhysics.mateAt(layout, i, t)
 			local spec = layout.teammates[i]
 			local running = spec.speed > 0 and flat(at - spec.to).Magnitude > 0.2
-			slowMove(mate, at, if running then flat(spec.to - spec.from) else flat(carrier - at), dt)
-			slowFigures[mate] = true
+			mate:moveTo(at, if running then flat(spec.to - spec.from) else flat(carrier - at), dt * SLOW)
+			slow[mate] = true
 			placeRing(self.mateRings[i], at)
-			-- The teammate the line points at calls for it.
-			local calling = self.aimTarget and flat(self.aimTarget - at).Magnitude < 7
-			mate:play(if calling then "WAVE" else nil)
+			local open = MomentPhysics.isOpen(layout, i, t)
+			self.bubbles[i].Enabled = self.phase == "DECIDE" and open
+			self.bubbles[i].StudsOffset = Vector3.new(0, 2.6 + 0.25 * math.sin(os.clock() * 5 + i), 0)
+			local targeted = self.aimInfo and self.aimInfo.mate == i
+			self.mateRings[i].stroke.Color = if targeted then GOLD elseif open then LIME else LILAC
 		end
-		local facing = self.aim or toGoal
+		local facing = if self.aimInfo and self.aimInfo.kind ~= "SHORT" then unit(flat(self.aimInfo.target - carrier), toGoal) else toGoal
 		self.me:moveTo(standFor(carrier, facing), facing, dt * SLOW)
-		slowFigures[self.me] = true
-		local pulse = 0.5 + 0.5 * math.sin(os.clock() * 8)
-		for _, ring in self.dangerRings do
-			ring.frame.BackgroundTransparency = 0.8 - 0.25 * pulse * (1 - (self:pressure() or 1))
-		end
-		if t >= layout.tackleTime then
+		slow[self.me] = true
+		placeRing(self.meRing, carrier)
+		if self.phase == "DECIDE" and t >= layout.tackleTime then
 			self:tackle(nil)
 		end
-	elseif self.phase == "RELEASED" or self.phase == "SHOT" then
+	elseif self.phase == "STRUCK" then
+		-- Waiting for the server: the kick plays, the ball barely moves.
 		for i, defender in self.defenders do
 			if layout.defenders[i] then
-				defender:moveTo(defender.position, flat(Vector3.zero - defender.position), dt)
+				defender:moveTo(defender.position, flat(carrier - defender.position), dt)
 			end
 		end
 	elseif self.phase == "TACKLE" then
 		self.clock += dt
-		local k = smooth(self.clock / 0.5)
-		self:_moveBall(flat(carrier):Lerp(self.tackleBallTo, k) + Vector3.new(0, BALL_RADIUS, 0))
+		self:_moveBall(flat(carrier):Lerp(self.tackleBallTo, smooth(self.clock / 0.5)) + Vector3.new(0, BALL_RADIUS, 0))
 		local tackler = self.tackleBy
 		if tackler and self.clock < 0.4 then
 			tackler:moveTo(tackler.position:Lerp(flat(carrier), math.min(1, dt * 6)), flat(carrier - tackler.position), dt)
 		end
 	elseif self.phase == "REPLAY" and self.replay and self.replay.token == self.token then
 		self:_updateReplay(dt)
-	elseif self.phase == "FOLLOWUP" then
-		local fu = self.followUp
-		local mate = self.mates[fu.receiver]
-		if not fu.header and not mate:isCelebrating() then
-			local towards = fu.stand - mate.position
-			local stepLen = math.min(towards.Magnitude, 9 * dt)
-			mate:moveTo(if towards.Magnitude > 1e-3 then mate.position + towards.Unit * stepLen else fu.stand, fu.toGoal, dt)
-		end
 	end
 
-	-- Camera: behind you, gliding in at the start; the shot camera takes over for a finish.
-	if self.cameraOn then
-		local camera = workspace.CurrentCamera
-		camera.CameraType = Enum.CameraType.Scriptable
-		local position, look = cameraFor(layout)
-		if self.cameraLook then
-			look = look:Lerp(self.cameraLook, 0.35)
-		end
-		self.smoothLook = if self.smoothLook then self.smoothLook:Lerp(look, math.min(1, dt * 4)) else look
-		local target = CFrame.lookAt(position, self.smoothLook)
-		if self.blendT < 1 then
-			self.blendT = math.min(1, self.blendT + dt / CAMERA_BLEND)
-			local k = smooth(self.blendT)
-			camera.CFrame = self.blendFrom:Lerp(target, k)
-			camera.FieldOfView = self.blendFov + (CAMERA_FOV - self.blendFov) * k
-		else
-			camera.CFrame = target
-			camera.FieldOfView = CAMERA_FOV
-		end
+	if self.onTimer then
+		self.onTimer(self:timeLeft())
 	end
-
-	for _, figure in { self.me, self.mates[1], self.mates[2], table.unpack(self.defenders) } do
-		figure:update(if slowFigures[figure] then dt * SLOW else dt)
-	end
-end
-
--- The server turned the input down (e.g. sent too fast): back to deciding, clock still running.
-function MomentVisuals:resume()
-	if self.phase ~= "RELEASED" then
-		return
-	end
-	self.released = false
-	self.phase = "DECIDE"
-	self:_setSlowMo(true)
-	for i, ring in self.dangerRings do
-		local spec = self.layout.defenders[i]
-		ring.part.Parent = if spec and spec.role == "PRESS" then self.folder else nil
+	for _, figure in self:_figures() do
+		figure:update(if slow[figure] then dt * SLOW else dt)
 	end
 end
 
