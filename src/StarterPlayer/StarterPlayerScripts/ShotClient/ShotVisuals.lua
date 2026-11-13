@@ -302,6 +302,31 @@ function ShotVisuals:setCharging(on: boolean)
 	end
 end
 
+-- Match moments: the moment scene drives the camera while you decide (false); true glides back
+-- to the shot camera (a teammate's finish).
+function ShotVisuals:setCameraEnabled(enabled: boolean)
+	if enabled and self.cameraEnabled == false then
+		local camera = workspace.CurrentCamera
+		self.blendFrom, self.blendFov, self.blendT = camera.CFrame, camera.FieldOfView, 0
+	end
+	self.cameraEnabled = enabled
+end
+
+-- Match moments: the shot will start here (aiming arc), the moment scene holds the ball until then.
+function ShotVisuals:setSpot(spot: Vector3)
+	self.token += 1
+	self.holdBall = false
+	self.trail.Enabled = false
+	self.spot = spot
+	self:_setBall(Vector3.new(0, -50, 0))
+	if self.keeper then
+		self.keeper:recover()
+	end
+	if self.netBack then
+		self.netBack.CFrame = self.netBackHome
+	end
+end
+
 -- Settings: camera shake on goals and frame hits.
 function ShotVisuals:setShakeEnabled(enabled: boolean)
 	self.shakeEnabled = enabled
@@ -313,7 +338,7 @@ function ShotVisuals:update(dt: number)
 	self.shake = math.max(0, self.shake - dt * 2.5)
 	self.fovKick = math.max(0, self.fovKick - dt * 10)
 
-	if self.active then
+	if self.active and self.cameraEnabled ~= false then
 		local camera = workspace.CurrentCamera
 		camera.CameraType = Enum.CameraType.Scriptable
 		local fov = ShotConfig.Camera.FieldOfView - self.fovKick

@@ -269,8 +269,8 @@ function PassVisuals:followUpKick()
 	end
 end
 
--- The shot after the pass went in: the scorer sprints towards the near corner flag and goes into
--- a knee slide (see _updateFollowUp).
+-- The shot after the pass went in: the scorer turns towards the near corner flag and goes into a
+-- random celebration (Celebrations, see _updateCelebration).
 function PassVisuals:celebrateGoal()
 	local fu = self.followUp
 	if fu and not fu.celebration then
@@ -279,33 +279,16 @@ function PassVisuals:celebrateGoal()
 	end
 end
 
-local CELEBRATION_RUN = 0.7 -- seconds of sprint before he drops to his knees
-local CELEBRATION_SPEED = 11 -- studs/s at the end of the sprint
-local SLIDE_TIME = 0.75 -- seconds the slide takes to stop
-
 function PassVisuals:_updateCelebration(receiver, c, dt: number)
 	c.t += dt
 	if c.t < 0 then
 		receiver:moveTo(receiver.position, c.dir, dt) -- watches the ball go in first
 		return
 	end
-	local speed
-	if c.t < CELEBRATION_RUN then
-		speed = CELEBRATION_SPEED * math.min(1, 0.4 + c.t / CELEBRATION_RUN)
-	else
-		if not c.sliding then
-			c.sliding = true
-			receiver:play("SLIDE")
-		end
-		speed = CELEBRATION_SPEED * math.max(0, 1 - (c.t - CELEBRATION_RUN) / SLIDE_TIME)
-	end
-	if c.sliding then
-		-- Sliding on the knees, not running: move the figure directly.
-		receiver.position += c.dir * speed * dt
+	if not c.started then
+		c.started = true
 		receiver.facing = c.dir
-		receiver.speed = 0
-	else
-		receiver:moveTo(receiver.position + c.dir * speed * dt, c.dir, dt)
+		receiver:celebrate()
 	end
 end
 

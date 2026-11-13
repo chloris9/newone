@@ -14,7 +14,9 @@ local JOINT_NAMES = {
 }
 
 -- One-shot actions and their length in seconds; WAVE, CHEER and SLIDE loop until replaced.
-local DURATION = { KICK = 0.5, TRAP = 0.55, LUNGE = 0.8, NOD = 0.8 }
+local DURATION = { KICK = 0.5, TRAP = 0.55, LUNGE = 0.8, NOD = 0.8, HEADER = 0.7, STUMBLE = 0.9 }
+
+local Celebrations = require(script.Parent:WaitForChild("Celebrations"))
 
 local function J(x: number, y: number, z: number): Vector3
 	return Vector3.new(x, y, z)
@@ -46,11 +48,46 @@ function FigureAnimator.new(model: Model, rootHeight: number, scale: number)
 	self.action = nil
 	self.actionTime = 0
 	self.drop = 0
+	self.celebration = nil -- Celebrations handle while one plays; it owns the joints then
+	self.celebrationDone = false
 	return self
+end
+
+-- Ends a celebration: joints back to rest, and the figure stays where it finished.
+function FigureAnimator:_endCelebration()
+	local handle = self.celebration
+	if not handle then
+		return
+	end
+	self.celebration = nil
+	handle:stop()
+	local pivot = self.model:GetPivot()
+	self.position = Vector3.new(pivot.Position.X, 0, pivot.Position.Z)
+	local look = Vector3.new(pivot.LookVector.X, 0, pivot.LookVector.Z)
+	if look.Magnitude > 1e-3 then
+		self.facing = look.Unit
+	end
+	self.joints = {}
+	self.speed = 0
+end
+
+-- A random goal celebration (Celebrations library); it holds its last pose until the next
+-- place / play.
+function FigureAnimator:celebrate(name: string?)
+	self:_endCelebration()
+	self.action = nil
+	local base = CFrame.lookAt(self.position, self.position + self.facing)
+	self.celebrationDone = false
+	self.celebration = Celebrations.play(self.model, base, self.rootHeight, { name = name, scale = self.scale })
+end
+
+function FigureAnimator:isCelebrating(): boolean
+	return self.celebration ~= nil
 end
 
 -- Jumps straight there (new episode).
 function FigureAnimator:place(position: Vector3, facing: Vector3?)
+	self:_endCelebration()
 	self.position = Vector3.new(position.X, 0, position.Z)
 	if facing and facing.Magnitude > 1e-3 then
 		self.facing = Vector3.new(facing.X, 0, facing.Z).Unit
@@ -79,6 +116,7 @@ function FigureAnimator:play(action: string?)
 	if self.action == action and (action == "WAVE" or action == "CHEER" or action == "SLIDE") then
 		return
 	end
+	self:_endCelebration()
 	self.action = action
 	self.actionTime = 0
 end
@@ -158,6 +196,30 @@ function FigureAnimator:_pose(): (Vector3, number)
 		-- Contract signed: arms stay relaxed, one short nod towards the camera.
 		local nod = math.max(0, math.sin(math.min(t, 0.8) / 0.8 * math.pi))
 		joints.Neck = J(16 * nod, 0, 0)
+	elseif action == "HEADER" then
+		-- Leaps to meet a cross: arms up for balance, head snaps forward at the top.
+		local jump = math.max(0, math.sin(math.clamp(t / 0.6, 0, 1) * math.pi))
+		local snap = smooth((t - 0.22) / 0.1) * (1 - smooth((t - 0.4) / 0.2))
+		joints.LeftShoulder = J(100 * jump, 0, -35)
+		joints.RightShoulder = J(100 * jump, 0, 35)
+		joints.LeftElbow = J(40, 0, 0)
+		joints.RightElbow = J(40, 0, 0)
+		joints.LeftKnee = J(-50 * jump, 0, 0)
+		joints.RightKnee = J(-30 * jump, 0, 0)
+		joints.Waist = J(10 * jump - 22 * snap, 0, 0)
+		joints.Neck = J(14 * jump - 30 * snap, 0, 0)
+		drop = -1.5 * jump
+		bob = 0
+	elseif action == "STUMBLE" then
+		-- Tackled: knocked off balance, arms flung out, staggers and recovers.
+		local k = smooth(t / 0.15) * (1 - smooth((t - 0.5) / 0.4))
+		joints.Waist = J(-30 * k, 8 * k, 0)
+		joints.Neck = J(15 * k, 0, 0)
+		joints.LeftShoulder = J(60 * k, 0, -70 * k)
+		joints.RightShoulder = J(20 * k, 0, 80 * k)
+		joints.LeftKnee = J(-40 * k, 0, 0)
+		joints.RightHip = J(-25 * k, 0, 0)
+		drop = 0.35 * k
 	elseif action == "SLIDE" then
 		-- Goal: down onto both knees (thighs upright, shins flat behind), leaning back with the
 		-- arms spread wide and the head thrown back; the fists pump once he has stopped.
@@ -183,6 +245,12 @@ end
 
 function FigureAnimator:update(dt: number)
 	self.clock += dt
+	if self.celebration then
+		if not self.celebrationDone and not self.celebration:update(dt) then
+			self.celebrationDone = true -- hold the final pose
+		end
+		return
+	end
 	local cadence = 1.6 + self.speed * 0.42 -- strides per second grow with speed
 	self.phase += dt * cadence * math.pi
 	if self.action then
