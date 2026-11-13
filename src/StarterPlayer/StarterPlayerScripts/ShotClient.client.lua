@@ -7,6 +7,17 @@ local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
+local StarterGui = game:GetService("StarterGui")
+
+-- A single-player career: Roblox's player list only covers the HUD's top-right corner.
+task.spawn(function()
+	for _ = 1, 20 do
+		if pcall(StarterGui.SetCoreGuiEnabled, StarterGui, Enum.CoreGuiType.PlayerList, false) then
+			return
+		end
+		task.wait(0.5)
+	end
+end)
 
 local Shared = ReplicatedStorage:WaitForChild("Shared")
 local ShotConfig = require(Shared:WaitForChild("ShotConfig"))
