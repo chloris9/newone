@@ -15,7 +15,7 @@ export type ShotStats = { shooting: number, keeperSkill: number }
 -- in a comfortable range, there is no scatter and the keeper dives too late.
 -- keeperDelay: extra keeper reaction time in seconds (easier keeper for the training task).
 -- start: ball position (default: the penalty-area spot); a shot after a pass starts at the receiver.
-export type ShotOptions = { guided: { aimX: number, aimY: number }?, keeperDelay: number?, start: Vector3? }
+export type ShotOptions = { guided: { aimX: number, aimY: number }?, keeperDelay: number?, start: Vector3?, scatterScale: number? }
 export type ShotResult = {
 	input: ShotInput, -- the input actually used (guided shots may move the aim)
 	outcome: string, -- "GOAL" | "SAVE" | "POST" | "MISS" (series history / scoring)
@@ -75,8 +75,8 @@ function ShotResolver.resolve(input: ShotInput, stats: ShotStats, rng: Random, o
 	-- 1. Inaccuracy: better shooters scatter less; overpowered shots scatter more and rise.
 	local skill = math.clamp(stats.shooting, 0, 100) / 100
 	local overpower = math.max(0, (input.power - accuracy.OverpowerFrom) / (1 - accuracy.OverpowerFrom))
-	local sigma = lerp(accuracy.ScatterAtZeroSkill, accuracy.ScatterAtMaxSkill, skill)
-		+ overpower * accuracy.OverpowerScatter
+	local sigma = (lerp(accuracy.ScatterAtZeroSkill, accuracy.ScatterAtMaxSkill, skill)
+		+ overpower * accuracy.OverpowerScatter) * ((options and options.scatterScale) or 1)
 	local cap = accuracy.MaxSigmas
 	local offsetX = math.clamp(gaussian(rng), -cap, cap) * sigma
 	local offsetY = math.clamp(gaussian(rng), -cap, cap) * sigma + overpower * accuracy.OverpowerLift
